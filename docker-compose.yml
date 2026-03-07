@@ -1,0 +1,85 @@
+version: "3.9"
+
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  user-service:
+    build: ./user-service
+    environment:
+      DB_PATH: /data/user.db
+    volumes:
+      - user_data:/data
+    ports:
+      - "8081:8081"
+
+  file-service:
+    build: ./file-service
+    environment:
+      DB_PATH: /data/file.db
+    volumes:
+      - file_data:/data
+      - ./audio_data:/data/audio
+    ports:
+      - "8082:8082"
+
+  processing-service:
+    build: ./processing-service
+    environment:
+      DB_PATH: /data/processing.db
+      REDIS_ADDR: redis:6379
+      FILE_SERVICE_URL: http://file-service:8082
+      AUDIO_ROOT: /data/audio
+      SPLEETER_IMAGE: poompower/spleeter:latest
+    volumes:
+      - processing_data:/data
+      - ./audio_data:/data/audio
+      - /var/run/docker.sock:/var/run/docker.sock
+    ports:
+      - "8083:8083"
+    depends_on:
+      - redis
+      - file-service
+
+  library-service:
+    build: ./library-service
+    environment:
+      PORT: "8084"
+      USER_SERVICE_URL: http://gateway:8080
+    volumes:
+      - library_data:/data
+    ports:
+      - "8084:8084"
+    depends_on:
+      - user-service
+      - gateway
+
+  gateway:
+    build: ./gateway
+    environment:
+      USER_SERVICE_URL: http://user-service:8081
+      FILE_SERVICE_URL: http://file-service:8082
+      PROCESSING_SERVICE_URL: http://processing-service:8083
+      LIBRARY_SERVICE_URL: http://library-service:8084
+      JWT_SECRET: "change-me-super-secret"
+    ports:
+      - "8080:8080"
+    depends_on:
+      - user-service
+      - file-service
+      - processing-service
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      - gateway
+
+volumes:
+  user_data:
+  file_data:
+  processing_data:
+  library_data:

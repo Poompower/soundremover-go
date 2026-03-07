@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="th">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Welcome | Sound Remover</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/style/index.css">
+</head>
+<body class="d-flex flex-column min-vh-100">
+  <nav class="navbar navbar-expand-lg navbar-lofi py-3">
+    <div class="container">
+      <a class="navbar-brand text-white fw-bold" id="navHome" href="/">Sound Remover</a>
+      <div class="ms-auto d-flex gap-2">
+        <a class="btn btn-sm btn-outline-info rounded-3 d-none" id="dashboardBtn" href="/dashboard.html">Dashboard</a>
+        <button class="btn btn-sm btn-outline-light rounded-3 d-none" id="logoutBtn">Logout</button>
+      </div>
+    </div>
+  </nav>
+
+  <main class="flex-grow-1 d-flex align-items-center">
+    <div class="container text-center">
+      <h1 class="display-4 fw-bold">Welcome to Sound Remover</h1>
+      <p class="lead muted">ระบบแยกเสียงร้องและดนตรีออกจากไฟล์เสียงของคุณได้อย่างง่ายดาย</p>
+      <div class="mt-4 d-flex justify-content-center gap-3" id="heroActions">
+        <button type="button" class="btn-space" data-bs-toggle="modal" data-bs-target="#authModal" onclick="openTab('login')" id="authBtn">
+          <strong>Sign In/Sign Up</strong>
+          <div id="container-stars"><div id="stars"></div></div>
+          <div id="glow"><div class="circle"></div><div class="circle"></div></div>
+        </button>
+      </div>
+    </div>
+  </main>
+
+  <footer class="text-center muted small py-3">
+    © 2026 Sound Remover
+  </footer>
+
+  <div class="modal fade" id="authModal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog modal-dialog-centered modal-md">
+      <div class="modal-content bg-dark text-white rounded-4 shadow-lg">
+        <div class="modal-header border-0">
+          <ul class="nav nav-tabs w-100" role="tablist">
+            <li class="nav-item w-50" role="presentation">
+              <button class="nav-link active w-100" id="login-tab" data-bs-toggle="tab" data-bs-target="#loginTab" type="button" role="tab">Login</button>
+            </li>
+            <li class="nav-item w-50" role="presentation">
+              <button class="nav-link w-100" id="register-tab" data-bs-toggle="tab" data-bs-target="#registerTab" type="button" role="tab">Register</button>
+            </li>
+          </ul>
+        </div>
+        <div class="modal-body pt-2">
+          <div class="tab-content">
+            <div class="tab-pane fade show active" id="loginTab" role="tabpanel">
+              <div class="alert alert-danger d-none" id="loginAlert"></div>
+              <form id="loginForm">
+                <div class="mb-3">
+                  <label class="form-label">Username or Email</label>
+                  <input class="form-control" name="username" required>
+                </div>
+                <div class="mb-3">
+                  <label class="form-label">Password</label>
+                  <input type="password" class="form-control" name="password" required>
+                </div>
+                <button type="submit" class="btn btn-primary w-100">Sign In</button>
+              </form>
+            </div>
+            <div class="tab-pane fade" id="registerTab" role="tabpanel">
+              <div class="alert alert-danger d-none" id="registerAlert"></div>
+              <form id="registerForm">
+                <div class="mb-2">
+                  <label class="form-label">First Name</label>
+                  <input class="form-control" name="first_name" required>
+                </div>
+                <div class="mb-2">
+                  <label class="form-label">Last Name</label>
+                  <input class="form-control" name="last_name" required>
+                </div>
+                <div class="mb-2">
+                  <label class="form-label">Email</label>
+                  <input type="email" class="form-control" name="email" required>
+                </div>
+                <div class="mb-2">
+                  <label class="form-label">Username</label>
+                  <input class="form-control" name="username" required>
+                </div>
+                <div class="mb-3">
+                  <label class="form-label">Password</label>
+                  <input type="password" class="form-control" name="password" required>
+                </div>
+                <button type="submit" class="btn btn-success w-100">Create Account</button>
+              </form>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
+  <script src="/js/index.js"></script>
+</body>
+</html>
