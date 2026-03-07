@@ -1,35 +1,90 @@
-version: "3.9"
-
 services:
-  redis:
-    image: redis:7-alpine
+  consul:
+    image: hashicorp/consul:1.20
+    command: agent -server -bootstrap-expect=1 -ui -client=0.0.0.0
     ports:
-      - "6379:6379"
+      - "8500:8500"
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+
+  grafana:
+    image: grafana/grafana:11.2.2
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3001:3000"
+    depends_on:
+      - prometheus
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.60
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"
+      - "4317:4317"
+      - "4318:4318"
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    ports:
+      - "5672:5672"
+      - "15672:15672"
 
   user-service:
     build: ./user-service
     environment:
       DB_PATH: /data/user.db
+      CONSUL_ADDR: consul:8500
+      SERVICE_HOST: user-service
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      OTEL_EXPORTER_OTLP_ENDPOINT: jaeger:4318
     volumes:
       - user_data:/data
     ports:
       - "8081:8081"
+    depends_on:
+      - consul
+      - rabbitmq
+      - jaeger
 
   file-service:
     build: ./file-service
     environment:
       DB_PATH: /data/file.db
+      CONSUL_ADDR: consul:8500
+      SERVICE_HOST: file-service
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      OTEL_EXPORTER_OTLP_ENDPOINT: jaeger:4318
     volumes:
       - file_data:/data
       - ./audio_data:/data/audio
     ports:
       - "8082:8082"
+    depends_on:
+      - consul
+      - rabbitmq
+      - jaeger
 
   processing-service:
     build: ./processing-service
     environment:
       DB_PATH: /data/processing.db
-      REDIS_ADDR: redis:6379
+      CONSUL_ADDR: consul:8500
+      SERVICE_HOST: processing-service
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      OTEL_EXPORTER_OTLP_ENDPOINT: jaeger:4318
       FILE_SERVICE_URL: http://file-service:8082
       AUDIO_ROOT: /data/audio
       SPLEETER_IMAGE: poompower/spleeter:latest
@@ -40,21 +95,29 @@ services:
     ports:
       - "8083:8083"
     depends_on:
-      - redis
+      - consul
+      - rabbitmq
       - file-service
+      - jaeger
 
   library-service:
     build: ./library-service
     environment:
       PORT: "8084"
+      CONSUL_ADDR: consul:8500
+      SERVICE_HOST: library-service
       USER_SERVICE_URL: http://gateway:8080
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      OTEL_EXPORTER_OTLP_ENDPOINT: jaeger:4318
     volumes:
       - library_data:/data
     ports:
       - "8084:8084"
     depends_on:
+      - consul
       - user-service
       - gateway
+      - jaeger
 
   gateway:
     build: ./gateway
@@ -63,13 +126,19 @@ services:
       FILE_SERVICE_URL: http://file-service:8082
       PROCESSING_SERVICE_URL: http://processing-service:8083
       LIBRARY_SERVICE_URL: http://library-service:8084
+      CONSUL_ADDR: consul:8500
+      SERVICE_HOST: gateway
       JWT_SECRET: "change-me-super-secret"
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      OTEL_EXPORTER_OTLP_ENDPOINT: jaeger:4318
     ports:
       - "8080:8080"
     depends_on:
+      - consul
       - user-service
       - file-service
       - processing-service
+      - jaeger
 
   frontend:
     build: ./frontend
@@ -77,6 +146,8 @@ services:
       - "3000:80"
     depends_on:
       - gateway
+      - grafana
+      - prometheus
 
 volumes:
   user_data:

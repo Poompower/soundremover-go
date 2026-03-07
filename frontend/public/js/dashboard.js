@@ -18,6 +18,9 @@ const state = {
   libraryItems: [],
   currentLibraryItem: null,
   syncMixer: null,
+  playlists: [],
+  pendingPlaylistJobID: null,
+  selectedPlaylistID: null,
 };
 
 function getAuthToken() {
@@ -102,6 +105,7 @@ function showAuthError(msg) {
 function initApp() {
   document.getElementById("auth-overlay").classList.add("hidden");
   document.getElementById("app").style.display = "flex";
+  loadPlaylists();
   initSeparatePage();
   updateSidebar();
   loadDiscover();
@@ -146,7 +150,7 @@ async function loadDiscover() {
     const albums = await api("GET", "/albums");
     renderAlbumGrid(el, albums || []);
   } catch (e) {
-    el.innerHTML = `<div class="empty-state"><div class="empty-state-icon">🌐</div><h3>${e.message}</h3></div>`;
+    el.innerHTML = `<div class="empty-state"><div class="empty-state-icon">ðŸŒ</div><h3>${e.message}</h3></div>`;
   }
 }
 
@@ -156,15 +160,66 @@ async function loadLibrary() {
   try {
     const data = await api("GET", "/jobs?status=SUCCEEDED&limit=60");
     state.libraryItems = (data && data.jobs) || [];
-    renderLibraryCards(el, state.libraryItems);
+    await loadPlaylists();
+    renderPlaylistSection();
+    renderLibraryCards(el, getVisibleLibraryItems());
   } catch (e) {
-    el.innerHTML = `<div class="empty-state"><div class="empty-state-icon">📁</div><h3>${esc(e.message || "No songs yet")}</h3></div>`;
+    el.innerHTML = `<div class="empty-state"><div class="empty-state-icon">ðŸ“</div><h3>${esc(e.message || "No songs yet")}</h3></div>`;
   }
+}
+
+async function loadPlaylists() {
+  try {
+    const playlists = await api("GET", "/playlists");
+    state.playlists = Array.isArray(playlists) ? playlists : [];
+  } catch (e) {
+    state.playlists = [];
+    showToast(e.message || "Cannot load playlists", "error");
+  }
+}
+
+function renderPlaylistSection() {
+  const container = document.getElementById("playlist-content");
+  if (!container) return;
+  container.innerHTML = `
+    <div class="playlist-strip">
+      <button class="playlist-pill ${state.selectedPlaylistID === null ? "active" : ""}" onclick="selectPlaylistFilter(null)">
+        <span class="playlist-pill-name">All Songs</span>
+        <span class="playlist-pill-count">${state.libraryItems.length}</span>
+      </button>
+      ${state.playlists
+        .map(
+          (p) => `
+        <button class="playlist-pill ${Number(state.selectedPlaylistID) === Number(p.id) ? "active" : ""}" onclick="selectPlaylistFilter(${p.id})">
+          <span class="playlist-pill-name">${esc(p.name || "Untitled")}</span>
+          <span class="playlist-pill-count">${Array.isArray(p.job_ids) ? p.job_ids.length : 0}</span>
+        </button>
+      `
+        )
+        .join("")}
+    </div>
+  `;
+}
+
+function getVisibleLibraryItems() {
+  if (state.selectedPlaylistID === null) return state.libraryItems;
+  const playlist = state.playlists.find((p) => Number(p.id) === Number(state.selectedPlaylistID));
+  if (!playlist || !Array.isArray(playlist.job_ids)) return [];
+  const ids = new Set(playlist.job_ids.map((id) => Number(id)));
+  return (state.libraryItems || []).filter((item) => ids.has(Number(item.id)));
+}
+
+function selectPlaylistFilter(playlistID) {
+  state.selectedPlaylistID = playlistID === null ? null : Number(playlistID);
+  renderPlaylistSection();
+  const el = document.getElementById("library-content");
+  if (!el) return;
+  renderLibraryCards(el, getVisibleLibraryItems());
 }
 
 function renderLibraryCards(container, items) {
   if (!items.length) {
-    container.innerHTML = '<div class="empty-state"><div class="empty-state-icon">🎼</div><h3>No separated songs yet</h3></div>';
+    container.innerHTML = '<div class="empty-state"><div class="empty-state-icon">??</div><h3>No separated songs yet</h3></div>';
     return;
   }
   container.innerHTML = `<div class="track-cards-grid">${items
@@ -172,10 +227,24 @@ function renderLibraryCards(container, items) {
       const sourceName = item.source_filename || `job_${item.id}`;
       const displayName = cleanSongTitle(sourceName);
       const stems = (item.stems || []).slice(0, 4);
+      const m = item.metadata || {};
       return `
         <div class="song-card" onclick="openLibraryTrack(${item.id})">
+          <div class="song-card-actions">
+            <button class="song-card-action-btn" onclick="openAddToPlaylistModal(event, ${item.id})">Add to Playlist</button>
+          </div>
           <div class="song-card-title">${esc(displayName)}</div>
-          <div class="song-card-meta">Job #${item.id} • ${esc(item.model || "2stems")}</div>
+          <div class="song-card-meta">Job #${item.id} · ${esc(item.model || "2stems")}</div>
+          <div class="song-card-meta-grid">
+            <div><span>file_name:</span> ${esc(m.file_name || sourceName)}</div>
+            <div><span>title:</span> ${esc(m.title || displayName)}</div>
+            <div><span>artist:</span> ${esc(m.artist || "-")}</div>
+            <div><span>genre:</span> ${esc(m.genre || "-")}</div>
+            <div><span>duration:</span> ${fmtDurationMeta(m.duration)}</div>
+            <div><span>bitrate:</span> ${fmtBitrateMeta(m.bitrate)}</div>
+            <div><span>size:</span> ${fmtSizeMeta(m.size)}</div>
+            <div><span>upload_date:</span> ${fmtUploadDateMeta(m.upload_date)}</div>
+          </div>
           <div class="song-card-badges">
             ${stems.map((s) => `<span class="stem-badge">${esc(s)}</span>`).join("")}
           </div>
@@ -185,18 +254,117 @@ function renderLibraryCards(container, items) {
     .join("")}</div>`;
 }
 
+function openCreatePlaylistModal() {
+  const input = document.getElementById("new-playlist-name");
+  if (input) input.value = "";
+  document.getElementById("create-playlist-modal").classList.remove("hidden");
+}
+
+async function createPlaylist() {
+  const input = document.getElementById("new-playlist-name");
+  const name = (input && input.value ? input.value : "").trim();
+  if (!name) {
+    showToast("Playlist name is required", "error");
+    return;
+  }
+  try {
+    await api("POST", "/playlists", { name });
+    await loadPlaylists();
+  } catch (e) {
+    showToast(e.message || "Create playlist failed", "error");
+    return;
+  }
+  renderPlaylistSection();
+  closeModal("create-playlist-modal");
+  showToast("Playlist created", "success");
+}
+
+async function openAddToPlaylistModal(event, jobID) {
+  if (event) {
+    event.preventDefault();
+    event.stopPropagation();
+  }
+  await loadPlaylists();
+  state.pendingPlaylistJobID = Number(jobID);
+  if (!state.playlists.length) {
+    showToast("Create playlist first", "error");
+    openCreatePlaylistModal();
+    return;
+  }
+  const select = document.getElementById("playlist-select");
+  if (!select) return;
+  select.innerHTML = state.playlists
+    .map((p) => `<option value="${p.id}">${esc(p.name)} (${Array.isArray(p.job_ids) ? p.job_ids.length : 0})</option>`)
+    .join("");
+  document.getElementById("add-to-playlist-modal").classList.remove("hidden");
+}
+
+async function confirmAddToPlaylist() {
+  const select = document.getElementById("playlist-select");
+  if (!select || !state.pendingPlaylistJobID) {
+    showToast("Invalid selection", "error");
+    return;
+  }
+  const playlistID = Number(select.value);
+  const playlist = state.playlists.find((p) => Number(p.id) === playlistID);
+  if (!playlist) {
+    showToast("Playlist not found", "error");
+    return;
+  }
+  try {
+    await api("POST", `/playlists/${playlistID}/jobs`, { job_id: state.pendingPlaylistJobID });
+    await loadPlaylists();
+  } catch (e) {
+    showToast(e.message || "Add to playlist failed", "error");
+    return;
+  }
+  renderPlaylistSection();
+  const el = document.getElementById("library-content");
+  if (el) renderLibraryCards(el, getVisibleLibraryItems());
+  closeModal("add-to-playlist-modal");
+  showToast(`Added to ${playlist.name}`, "success");
+}
+
 function cleanSongTitle(filename) {
   const base = (filename || "").split(/[\\/]/).pop() || "";
   return base.replace(/\.[^.]+$/, "") || "Untitled";
 }
 
+function fmtDurationMeta(v) {
+  const n = Number(v);
+  if (!isFinite(n) || n <= 0) return "-";
+  return fmtTime(Math.floor(n));
+}
+
+function fmtBitrateMeta(v) {
+  const n = Number(v);
+  if (!isFinite(n) || n <= 0) return "-";
+  return `${Math.round(n / 1000)} kbps`;
+}
+
+function fmtSizeMeta(v) {
+  const n = Number(v);
+  if (!isFinite(n) || n <= 0) return "-";
+  const mb = n / (1024 * 1024);
+  if (mb >= 1) return `${mb.toFixed(2)} MB`;
+  const kb = n / 1024;
+  return `${kb.toFixed(1)} KB`;
+}
+
+function fmtUploadDateMeta(v) {
+  if (!v) return "-";
+  const d = new Date(v);
+  if (Number.isNaN(d.getTime())) return esc(String(v));
+  return d.toLocaleString();
+}
+
 function renderAlbumGrid(container, albums) {
   if (!albums.length) {
-    container.innerHTML = '<div class="empty-state"><div class="empty-state-icon">🎵</div><h3>No albums here yet</h3></div>';
+    container.innerHTML = '<div class="empty-state"><div class="empty-state-icon">ðŸŽµ</div><h3>No albums here yet</h3></div>';
     return;
   }
   const colors = ["cover-1", "cover-2", "cover-3", "cover-4", "cover-5"];
-  const emojis = ["🎵", "🎸", "🎹", "🎺", "🥁", "🎻", "🎤", "🎧"];
+  const emojis = ["ðŸŽµ", "ðŸŽ¸", "ðŸŽ¹", "ðŸŽº", "ðŸ¥", "ðŸŽ»", "ðŸŽ¤", "ðŸŽ§"];
   container.innerHTML = `<div class="albums-grid">${albums
     .map(
       (a, i) => `
@@ -238,13 +406,13 @@ async function openAlbum(id) {
     state.currentAlbum = album;
     renderAlbumDetail(el, album);
   } catch (e) {
-    el.innerHTML = `<div class="empty-state"><div class="empty-state-icon">⚠️</div><h3>${e.message}</h3></div>`;
+    el.innerHTML = `<div class="empty-state"><div class="empty-state-icon">âš ï¸</div><h3>${e.message}</h3></div>`;
   }
 }
 
 function renderAlbumDetail(container, album) {
   const isOwner = state.user && album.owner_id === state.user.id;
-  const emojis = ["🎵", "🎸", "🎹", "🎺", "🥁", "🎻"];
+  const emojis = ["ðŸŽµ", "ðŸŽ¸", "ðŸŽ¹", "ðŸŽº", "ðŸ¥", "ðŸŽ»"];
   const emoji = emojis[album.id % emojis.length];
   const totalDuration = (album.tracks || []).reduce((s, t) => s + t.duration, 0);
 
@@ -258,11 +426,11 @@ function renderAlbumDetail(container, album) {
         }
       </div>
       <div class="album-detail-info">
-        <div class="album-detail-type">Album &nbsp;•&nbsp; <span class="badge badge-${album.visibility}">${album.visibility}</span></div>
+        <div class="album-detail-type">Album &nbsp;â€¢&nbsp; <span class="badge badge-${album.visibility}">${album.visibility}</span></div>
         <div class="album-detail-title">${esc(album.title)}</div>
         <div class="album-detail-meta">
-          ${album.genre ? esc(album.genre) + " &nbsp;•&nbsp; " : ""}
-          ${album.year ? album.year + " &nbsp;•&nbsp; " : ""}
+          ${album.genre ? esc(album.genre) + " &nbsp;â€¢&nbsp; " : ""}
+          ${album.year ? album.year + " &nbsp;â€¢&nbsp; " : ""}
           ${(album.tracks || []).length} songs, ${fmtTime(totalDuration)}
         </div>
         ${album.description ? `<div style="margin-top:12px;color:var(--muted);font-size:14px;">${esc(album.description)}</div>` : ""}
@@ -277,7 +445,7 @@ function renderAlbumDetail(container, album) {
         isOwner
           ? `
         <button class="btn-visibility" onclick="toggleVisibility(${album.id}, '${album.visibility}')">
-          ${album.visibility === "public" ? "🔒 Make Private" : "🌐 Make Public"}
+          ${album.visibility === "public" ? "ðŸ”’ Make Private" : "ðŸŒ Make Public"}
         </button>
         <button class="btn-create" onclick="openAddTrackModal(${album.id})" style="font-size:13px;padding:8px 16px;">
           + Add Track
@@ -309,7 +477,7 @@ function renderAlbumDetail(container, album) {
           <div class="track-plays">${fmtPlays(t.plays || 0)}</div>
           <div class="track-duration">${fmtTime(t.duration || 0)}</div>
           <div class="track-actions">
-            ${isOwner ? `<button class="btn-delete-track" onclick="event.stopPropagation(); deleteTrack(${album.id}, ${t.id})">🗑</button>` : ""}
+            ${isOwner ? `<button class="btn-delete-track" onclick="event.stopPropagation(); deleteTrack(${album.id}, ${t.id})">ðŸ—‘</button>` : ""}
           </div>
         </div>
       `
@@ -318,7 +486,7 @@ function renderAlbumDetail(container, album) {
     `
         : `
       <div class="empty-state" style="padding:40px;">
-        <div class="empty-state-icon">🎵</div>
+        <div class="empty-state-icon">ðŸŽµ</div>
         <h3>No tracks yet</h3>
         ${isOwner ? "<p>Add your first track above</p>" : ""}
       </div>
@@ -1051,3 +1219,4 @@ async function downloadJobStem(stem) {
     showToast(err.message || "Download failed", "error");
   }
 }
+

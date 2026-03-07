@@ -102,6 +102,16 @@ body {
   cursor: pointer; transition: opacity .2s;
 }
 .btn-create:hover { opacity: .85; }
+.btn-create-alt {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text);
+}
+.btn-create-alt:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+  opacity: 1;
+}
 .btn-cancel {
   padding: 10px 20px; background: none;
   border: 1px solid var(--border); border-radius: 8px;
@@ -189,6 +199,33 @@ body {
 .page.active { display: block; }
 .page-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 32px; }
 .page-title { font-family: 'Syne', sans-serif; font-size: 32px; font-weight: 800; }
+.library-header-actions { display: flex; gap: 10px; align-items: center; }
+.playlist-content { margin-bottom: 18px; }
+.playlist-strip { display: flex; flex-wrap: wrap; gap: 10px; }
+.playlist-pill {
+  border: 1px solid var(--border);
+  appearance: none;
+  outline: none;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-radius: 999px;
+  background: #121827;
+}
+.playlist-pill.active {
+  border-color: #3dd6c6;
+  background: #102327;
+}
+.playlist-pill-name { font-size: 12px; color: var(--text); }
+.playlist-pill-count {
+  font-size: 11px;
+  color: #9ad8ff;
+  border: 1px solid #304f66;
+  border-radius: 999px;
+  padding: 1px 7px;
+}
 
 /* ── Album Grid ───────────────────────────────────────────── */
 .albums-grid {
@@ -376,6 +413,24 @@ body {
   transition: transform .15s, border-color .15s;
 }
 .song-card:hover { transform: translateY(-2px); border-color: #3dd6c6; }
+.song-card-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 10px;
+}
+.song-card-action-btn {
+  border: 1px solid #3f4f68;
+  background: #101a2a;
+  color: #a9c7e8;
+  border-radius: 999px;
+  padding: 5px 10px;
+  font-size: 11px;
+  cursor: pointer;
+}
+.song-card-action-btn:hover {
+  border-color: #5fd2c7;
+  color: #5fd2c7;
+}
 .song-card-title {
   font-family: 'Syne', sans-serif;
   font-size: 17px;
@@ -383,6 +438,21 @@ body {
   margin-bottom: 8px;
 }
 .song-card-meta { color: var(--muted); font-size: 12px; }
+.song-card-meta-grid {
+  margin-top: 10px;
+  border: 1px solid #263247;
+  background: #0f1624;
+  border-radius: 10px;
+  padding: 9px 10px;
+  display: grid;
+  gap: 5px;
+  font-size: 11px;
+  color: #9fb2cc;
+}
+.song-card-meta-grid span {
+  color: #6f84a4;
+  margin-right: 4px;
+}
 .song-card-badges { margin-top: 14px; display: flex; flex-wrap: wrap; gap: 6px; }
 .stem-badge {
   font-size: 11px;

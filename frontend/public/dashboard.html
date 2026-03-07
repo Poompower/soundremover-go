@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>SoundVault Dashboard</title>
   <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;500;600;700;800&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/style/library.css">
+  <link rel="stylesheet" href="/style/library.css?v=20260307g">
 </head>
 <body>
 
@@ -116,8 +116,12 @@
       <div class="page" id="page-library">
         <div class="page-header">
           <div class="page-title">My Library</div>
-          <button class="btn-create" onclick="loadLibrary()">Refresh</button>
+          <div class="library-header-actions">
+            <button class="btn-create btn-create-alt" onclick="openCreatePlaylistModal()">Create Playlist</button>
+            <button class="btn-create" onclick="loadLibrary()">Refresh</button>
+          </div>
         </div>
+        <div id="playlist-content" class="playlist-content"></div>
         <div id="library-content">
           <div class="loading"><div class="spinner"></div>Loading...</div>
         </div>
@@ -287,7 +291,32 @@
   </div>
 </div>
 
+<div class="modal-overlay hidden" id="create-playlist-modal">
+  <div class="modal">
+    <div class="modal-title">Create Playlist</div>
+    <div class="form-group"><label class="form-label">Playlist Name *</label><input class="form-input" id="new-playlist-name" placeholder="My Favorites"></div>
+    <div class="modal-actions">
+      <button class="btn-cancel" onclick="closeModal('create-playlist-modal')">Cancel</button>
+      <button class="btn-primary" style="width:auto;padding:10px 24px;" onclick="createPlaylist()">Create</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal-overlay hidden" id="add-to-playlist-modal">
+  <div class="modal">
+    <div class="modal-title">Add To Playlist</div>
+    <div class="form-group">
+      <label class="form-label">Playlist *</label>
+      <select class="form-input" id="playlist-select"></select>
+    </div>
+    <div class="modal-actions">
+      <button class="btn-cancel" onclick="closeModal('add-to-playlist-modal')">Cancel</button>
+      <button class="btn-primary" style="width:auto;padding:10px 24px;" onclick="confirmAddToPlaylist()">Add</button>
+    </div>
+  </div>
+</div>
+
 <div id="toast"></div>
-<script src="/js/dashboard.js?v=20260307b"></script>
+<script src="/js/dashboard.js?v=20260307g"></script>
 </body>
 </html>

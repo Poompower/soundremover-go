@@ -2,8 +2,10 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -11,9 +13,21 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	amqp "github.com/rabbitmq/amqp091-go"
+	"github.com/sony/gobreaker"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/sdk/resource"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	semconv "go.opentelemetry.io/otel/semconv/v1.24.0"
 )
 
 type Cfg struct {
@@ -21,7 +35,21 @@ type Cfg struct {
 	FileURL       string
 	ProcessingURL string
 	LibraryURL    string
+	ConsulAddr    string
 	JWTSecret     []byte
+}
+
+func (c Cfg) userBase() string {
+	return resolveServiceBase(c.ConsulAddr, "user-service", c.UserURL)
+}
+func (c Cfg) fileBase() string {
+	return resolveServiceBase(c.ConsulAddr, "file-service", c.FileURL)
+}
+func (c Cfg) processingBase() string {
+	return resolveServiceBase(c.ConsulAddr, "processing-service", c.ProcessingURL)
+}
+func (c Cfg) libraryBase() string {
+	return resolveServiceBase(c.ConsulAddr, "library-service", c.LibraryURL)
 }
 
 type User struct {
@@ -56,21 +84,422 @@ type ValidateTokenReq struct {
 	Token string `json:"token"`
 }
 
+var upstreamHTTPClient *http.Client
+var cbMu sync.RWMutex
+var breakers map[string]*gobreaker.CircuitBreaker
+var discoveryMu sync.RWMutex
+var discoveryCache = map[string]discoveryEntry{}
+var httpRequestsTotal = prometheus.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: "soundremover_http_requests_total",
+		Help: "Total number of HTTP requests handled.",
+	},
+	[]string{"service", "method", "path", "status"},
+)
+var httpRequestDuration = prometheus.NewHistogramVec(
+	prometheus.HistogramOpts{
+		Name:    "soundremover_http_request_duration_seconds",
+		Help:    "HTTP request duration in seconds.",
+		Buckets: prometheus.DefBuckets,
+	},
+	[]string{"service", "method", "path"},
+)
+var rabbitPublishTotal = prometheus.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: "soundremover_rabbit_publish_total",
+		Help: "Total RabbitMQ publish attempts.",
+	},
+	[]string{"service", "exchange", "result"},
+)
+var circuitStateGauge = prometheus.NewGaugeVec(
+	prometheus.GaugeOpts{
+		Name: "soundremover_circuit_breaker_state",
+		Help: "Circuit breaker state for upstream services (1 active, 0 inactive).",
+	},
+	[]string{"service", "upstream", "state"},
+)
+var tracingEnabledGauge = prometheus.NewGaugeVec(
+	prometheus.GaugeOpts{
+		Name: "soundremover_tracing_enabled",
+		Help: "Whether tracing is enabled (1) or disabled (0).",
+	},
+	[]string{"service"},
+)
+
+type discoveryEntry struct {
+	BaseURL string
+	Expire  time.Time
+}
+
+func initMetrics() {
+	prometheus.MustRegister(httpRequestsTotal, httpRequestDuration, rabbitPublishTotal, circuitStateGauge, tracingEnabledGauge)
+}
+
+func normalizePath(path string) string {
+	parts := strings.Split(path, "/")
+	for i, p := range parts {
+		if p == "" {
+			continue
+		}
+		if _, err := strconv.Atoi(p); err == nil {
+			parts[i] = ":id"
+		}
+	}
+	return strings.Join(parts, "/")
+}
+
+func setCircuitState(service, upstream string, state gobreaker.State) {
+	states := []gobreaker.State{gobreaker.StateClosed, gobreaker.StateHalfOpen, gobreaker.StateOpen}
+	for _, s := range states {
+		val := 0.0
+		if s == state {
+			val = 1.0
+		}
+		circuitStateGauge.WithLabelValues(service, upstream, s.String()).Set(val)
+	}
+}
+
+func registerWithConsul(consulAddr, serviceName, serviceID, serviceHost string, servicePort int) error {
+	if strings.TrimSpace(consulAddr) == "" {
+		return nil
+	}
+	payload := map[string]any{
+		"ID":      serviceID,
+		"Name":    serviceName,
+		"Address": serviceHost,
+		"Port":    servicePort,
+		"Check": map[string]any{
+			"HTTP":                           fmt.Sprintf("http://%s:%d/health", serviceHost, servicePort),
+			"Method":                         "GET",
+			"Interval":                       "10s",
+			"Timeout":                        "2s",
+			"DeregisterCriticalServiceAfter": "1m",
+		},
+	}
+	b, _ := json.Marshal(payload)
+	endpoint := fmt.Sprintf("http://%s/v1/agent/service/register", consulAddr)
+	req, _ := http.NewRequest(http.MethodPut, endpoint, bytes.NewReader(b))
+	req.Header.Set("Content-Type", "application/json")
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		return fmt.Errorf("consul register status=%d", res.StatusCode)
+	}
+	return nil
+}
+
+func initConsulRegistration(consulAddr, serviceName string, servicePort int) {
+	if consulAddr == "" {
+		return
+	}
+	serviceHost := strings.TrimSpace(os.Getenv("SERVICE_HOST"))
+	if serviceHost == "" {
+		serviceHost = serviceName
+	}
+	serviceID := serviceName + "-" + url.QueryEscape(serviceHost)
+	for i := 0; i < 10; i++ {
+		if err := registerWithConsul(consulAddr, serviceName, serviceID, serviceHost, servicePort); err == nil {
+			log.Printf("[consul][%s] registered addr=%s:%d consul=%s", serviceName, serviceHost, servicePort, consulAddr)
+			return
+		} else {
+			log.Printf("[consul][%s] register failed: %v", serviceName, err)
+			time.Sleep(2 * time.Second)
+		}
+	}
+	log.Printf("[consul][%s] registration skipped after retries", serviceName)
+}
+
+func discoverServiceBase(consulAddr, serviceName string) (string, error) {
+	if strings.TrimSpace(consulAddr) == "" {
+		return "", errors.New("consul disabled")
+	}
+
+	discoveryMu.RLock()
+	if c, ok := discoveryCache[serviceName]; ok && time.Now().Before(c.Expire) {
+		discoveryMu.RUnlock()
+		return c.BaseURL, nil
+	}
+	discoveryMu.RUnlock()
+
+	endpoint := fmt.Sprintf("http://%s/v1/health/service/%s?passing=true", consulAddr, url.QueryEscape(serviceName))
+	req, _ := http.NewRequest(http.MethodGet, endpoint, nil)
+	client := &http.Client{Timeout: 2 * time.Second}
+	res, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("consul status=%d", res.StatusCode)
+	}
+
+	var entries []struct {
+		Service struct {
+			Address string `json:"Address"`
+			Port    int    `json:"Port"`
+		} `json:"Service"`
+		Node struct {
+			Address string `json:"Address"`
+		} `json:"Node"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&entries); err != nil {
+		return "", err
+	}
+	if len(entries) == 0 {
+		return "", errors.New("no healthy instance")
+	}
+	host := strings.TrimSpace(entries[0].Service.Address)
+	if host == "" {
+		host = strings.TrimSpace(entries[0].Node.Address)
+	}
+	port := entries[0].Service.Port
+	if host == "" || port == 0 {
+		return "", errors.New("invalid consul service address")
+	}
+	base := fmt.Sprintf("http://%s:%d", host, port)
+
+	discoveryMu.Lock()
+	discoveryCache[serviceName] = discoveryEntry{
+		BaseURL: base,
+		Expire:  time.Now().Add(5 * time.Second),
+	}
+	discoveryMu.Unlock()
+	return base, nil
+}
+
+func resolveServiceBase(consulAddr, serviceName, fallback string) string {
+	base, err := discoverServiceBase(consulAddr, serviceName)
+	if err != nil {
+		if fallback != "" {
+			log.Printf("[consul][gateway] discover failed service=%s err=%v fallback=%s", serviceName, err, fallback)
+			return strings.TrimRight(fallback, "/")
+		}
+		log.Printf("[consul][gateway] discover failed service=%s err=%v", serviceName, err)
+		return fallback
+	}
+	return strings.TrimRight(base, "/")
+}
+
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-func callJSON(method, url string, body any) (int, []byte, error) {
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *statusWriter) WriteHeader(code int) {
+	w.status = code
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func initRabbit(service string) (*amqp.Connection, *amqp.Channel) {
+	rabbitURL := os.Getenv("RABBITMQ_URL")
+	if rabbitURL == "" {
+		rabbitURL = "amqp://guest:guest@rabbitmq:5672/"
+	}
+	var conn *amqp.Connection
+	var err error
+	for i := 0; i < 5; i++ {
+		conn, err = amqp.Dial(rabbitURL)
+		if err == nil {
+			break
+		}
+		log.Printf("[rabbitmq][%s] dial failed: %v", service, err)
+		time.Sleep(1 * time.Second)
+	}
+	if err != nil {
+		log.Printf("[rabbitmq][%s] disabled after retries", service)
+		return nil, nil
+	}
+	ch, err := conn.Channel()
+	if err != nil {
+		log.Printf("[rabbitmq][%s] channel failed: %v", service, err)
+		_ = conn.Close()
+		return nil, nil
+	}
+	if err := ch.ExchangeDeclare("rest.events", "topic", true, false, false, false, nil); err != nil {
+		log.Printf("[rabbitmq][%s] exchange declare failed: %v", service, err)
+		_ = ch.Close()
+		_ = conn.Close()
+		return nil, nil
+	}
+	log.Printf("[rabbitmq][%s] ready exchange=rest.events", service)
+	return conn, ch
+}
+
+func publishREST(ch *amqp.Channel, service string, r *http.Request, status int, elapsedMs int64) {
+	if ch == nil {
+		return
+	}
+	path := r.URL.Path
+	if r.URL.RawQuery != "" {
+		path += "?" + r.URL.RawQuery
+	}
+	payload, _ := json.Marshal(map[string]any{
+		"service":    service,
+		"method":     r.Method,
+		"path":       path,
+		"status":     status,
+		"elapsed_ms": elapsedMs,
+		"ts":         time.Now().UTC().Format(time.RFC3339),
+	})
+	key := service + ".request"
+	err := ch.PublishWithContext(context.Background(), "rest.events", key, false, false, amqp.Publishing{
+		ContentType:  "application/json",
+		DeliveryMode: amqp.Persistent,
+		Body:         payload,
+	})
+	if err != nil {
+		log.Printf("[rabbitmq][%s] publish failed: %v", service, err)
+		rabbitPublishTotal.WithLabelValues(service, "rest.events", "error").Inc()
+		return
+	}
+	rabbitPublishTotal.WithLabelValues(service, "rest.events", "ok").Inc()
+	log.Printf("[rabbitmq][%s] published method=%s path=%s status=%d", service, r.Method, path, status)
+}
+
+func withRESTLogging(service string, ch *amqp.Channel, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		sw := &statusWriter{ResponseWriter: w, status: 200}
+		next.ServeHTTP(sw, r)
+		elapsed := time.Since(start).Milliseconds()
+		path := r.URL.Path
+		if r.URL.RawQuery != "" {
+			path += "?" + r.URL.RawQuery
+		}
+		metricPath := normalizePath(r.URL.Path)
+		httpRequestsTotal.WithLabelValues(service, r.Method, metricPath, strconv.Itoa(sw.status)).Inc()
+		httpRequestDuration.WithLabelValues(service, r.Method, metricPath).Observe(float64(elapsed) / 1000.0)
+		log.Printf("[rest][%s] method=%s path=%s status=%d elapsed_ms=%d", service, r.Method, path, sw.status, elapsed)
+		publishREST(ch, service, r, sw.status, elapsed)
+	})
+}
+
+func initTracer(service string) func(context.Context) error {
+	endpoint := os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+	if endpoint == "" {
+		endpoint = "jaeger:4318"
+	}
+	exp, err := otlptracehttp.New(context.Background(),
+		otlptracehttp.WithEndpoint(endpoint),
+		otlptracehttp.WithInsecure(),
+	)
+	if err != nil {
+		log.Printf("[tracing][%s] disabled: %v", service, err)
+		tracingEnabledGauge.WithLabelValues(service).Set(0)
+		return func(context.Context) error { return nil }
+	}
+	res, _ := resource.Merge(resource.Default(), resource.NewWithAttributes(
+		semconv.SchemaURL,
+		semconv.ServiceNameKey.String(service),
+	))
+	tp := sdktrace.NewTracerProvider(
+		sdktrace.WithBatcher(exp),
+		sdktrace.WithResource(res),
+	)
+	otel.SetTracerProvider(tp)
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
+		propagation.TraceContext{},
+		propagation.Baggage{},
+	))
+	tracingEnabledGauge.WithLabelValues(service).Set(1)
+	log.Printf("[tracing][%s] ready endpoint=%s", service, endpoint)
+	return tp.Shutdown
+}
+
+func initBreakers() {
+	settings := gobreaker.Settings{
+		Interval:    30 * time.Second,
+		Timeout:     20 * time.Second,
+		MaxRequests: 2,
+		OnStateChange: func(name string, from gobreaker.State, to gobreaker.State) {
+			log.Printf("[circuit-breaker][gateway] service=%s state=%s->%s", name, from.String(), to.String())
+			setCircuitState("gateway", name, to)
+		},
+		ReadyToTrip: func(counts gobreaker.Counts) bool {
+			return counts.ConsecutiveFailures >= 5
+		},
+	}
+	breakers = map[string]*gobreaker.CircuitBreaker{
+		"user-service": gobreaker.NewCircuitBreaker(func() gobreaker.Settings {
+			s := settings
+			s.Name = "user-service"
+			return s
+		}()),
+		"file-service": gobreaker.NewCircuitBreaker(func() gobreaker.Settings {
+			s := settings
+			s.Name = "file-service"
+			return s
+		}()),
+		"processing-service": gobreaker.NewCircuitBreaker(func() gobreaker.Settings {
+			s := settings
+			s.Name = "processing-service"
+			return s
+		}()),
+		"library-service": gobreaker.NewCircuitBreaker(func() gobreaker.Settings {
+			s := settings
+			s.Name = "library-service"
+			return s
+		}()),
+	}
+	setCircuitState("gateway", "user-service", gobreaker.StateClosed)
+	setCircuitState("gateway", "file-service", gobreaker.StateClosed)
+	setCircuitState("gateway", "processing-service", gobreaker.StateClosed)
+	setCircuitState("gateway", "library-service", gobreaker.StateClosed)
+}
+
+func callWithBreaker(service string, fn func() (*http.Response, error)) (*http.Response, error) {
+	cbMu.RLock()
+	cb := breakers[service]
+	cbMu.RUnlock()
+	if cb == nil {
+		return fn()
+	}
+	result, err := cb.Execute(func() (any, error) {
+		return fn()
+	})
+	if err != nil {
+		return nil, err
+	}
+	resp, _ := result.(*http.Response)
+	return resp, nil
+}
+
+func upstreamStatusFromErr(err error) int {
+	if errors.Is(err, gobreaker.ErrOpenState) || errors.Is(err, gobreaker.ErrTooManyRequests) {
+		return http.StatusServiceUnavailable
+	}
+	return http.StatusBadGateway
+}
+
+func writeUpstreamError(w http.ResponseWriter, service string, err error) {
+	status := upstreamStatusFromErr(err)
+	msg := service + " down"
+	if status == http.StatusServiceUnavailable {
+		msg = service + " temporarily unavailable (circuit open)"
+	}
+	writeJSON(w, status, map[string]string{"error": msg})
+}
+
+func callJSON(service, method, targetURL string, body any) (int, []byte, error) {
 	var buf io.Reader
 	if body != nil {
 		b, _ := json.Marshal(body)
 		buf = bytes.NewReader(b)
 	}
-	req, _ := http.NewRequest(method, url, buf)
+	req, _ := http.NewRequest(method, targetURL, buf)
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := callWithBreaker(service, func() (*http.Response, error) {
+		return upstreamHTTPClient.Do(req)
+	})
 	if err != nil {
 		return 0, nil, err
 	}
@@ -101,7 +530,7 @@ func parseBearer(r *http.Request, secret []byte) (User, error) {
 	return parseRawToken(raw, secret)
 }
 
-func proxyTo(w http.ResponseWriter, r *http.Request, targetURL string, body io.Reader, copyAuth bool) {
+func proxyTo(w http.ResponseWriter, r *http.Request, service, targetURL string, body io.Reader, copyAuth bool) {
 	req, _ := http.NewRequest(r.Method, targetURL, body)
 	if ct := r.Header.Get("Content-Type"); ct != "" {
 		req.Header.Set("Content-Type", ct)
@@ -111,9 +540,11 @@ func proxyTo(w http.ResponseWriter, r *http.Request, targetURL string, body io.R
 			req.Header.Set("Authorization", auth)
 		}
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := callWithBreaker(service, func() (*http.Response, error) {
+		return upstreamHTTPClient.Do(req)
+	})
 	if err != nil {
-		writeJSON(w, 502, map[string]string{"error": "upstream unavailable"})
+		writeUpstreamError(w, service, err)
 		return
 	}
 	defer resp.Body.Close()
@@ -184,18 +615,40 @@ func withCORS(next http.Handler) http.Handler {
 }
 
 func main() {
+	serviceName := "gateway"
+	initMetrics()
+	shutdownTracer := initTracer(serviceName)
+	defer func() {
+		_ = shutdownTracer(context.Background())
+	}()
 	cfg := Cfg{
 		UserURL:       os.Getenv("USER_SERVICE_URL"),
 		FileURL:       os.Getenv("FILE_SERVICE_URL"),
 		ProcessingURL: os.Getenv("PROCESSING_SERVICE_URL"),
 		LibraryURL:    os.Getenv("LIBRARY_SERVICE_URL"),
+		ConsulAddr:    strings.TrimSpace(os.Getenv("CONSUL_ADDR")),
 		JWTSecret:     []byte(os.Getenv("JWT_SECRET")),
 	}
 	if cfg.UserURL == "" || cfg.FileURL == "" || cfg.ProcessingURL == "" || cfg.LibraryURL == "" || len(cfg.JWTSecret) == 0 {
 		log.Fatal("missing env: USER_SERVICE_URL / FILE_SERVICE_URL / PROCESSING_SERVICE_URL / LIBRARY_SERVICE_URL / JWT_SECRET")
 	}
+	upstreamHTTPClient = &http.Client{
+		Timeout:   10 * time.Second,
+		Transport: otelhttp.NewTransport(http.DefaultTransport),
+	}
+	initBreakers()
+	log.Printf("[circuit-breaker][%s] ready", serviceName)
+	initConsulRegistration(cfg.ConsulAddr, serviceName, 8080)
+	rmqConn, rmqCh := initRabbit(serviceName)
+	if rmqConn != nil {
+		defer rmqConn.Close()
+	}
+	if rmqCh != nil {
+		defer rmqCh.Close()
+	}
 
 	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.Handler())
 
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{"ok": true})
@@ -239,9 +692,9 @@ func main() {
 			writeJSON(w, 400, map[string]string{"error": "invalid json"})
 			return
 		}
-		status, data, err := callJSON("POST", cfg.UserURL+"/register", req)
+		status, data, err := callJSON("user-service", "POST", cfg.userBase()+"/register", req)
 		if err != nil {
-			writeJSON(w, 502, map[string]string{"error": "user-service down"})
+			writeUpstreamError(w, "user-service", err)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -267,12 +720,12 @@ func main() {
 		if loginID == "" {
 			loginID = strings.TrimSpace(req.Email)
 		}
-		status, data, err := callJSON("POST", cfg.UserURL+"/login", LoginReq{
+		status, data, err := callJSON("user-service", "POST", cfg.userBase()+"/login", LoginReq{
 			Username: loginID,
 			Password: req.Password,
 		})
 		if err != nil {
-			writeJSON(w, 502, map[string]string{"error": "user-service down"})
+			writeUpstreamError(w, "user-service", err)
 			return
 		}
 		if status != 200 {
@@ -305,7 +758,7 @@ func main() {
 			writeJSON(w, 405, map[string]string{"error": "method not allowed"})
 			return
 		}
-		target := strings.TrimRight(cfg.UserURL, "/") + "/users/" + strconv.FormatUint(uint64(u.ID), 10)
+		target := cfg.userBase() + "/users/" + strconv.FormatUint(uint64(u.ID), 10)
 		var body io.Reader
 		if r.Method == http.MethodPut {
 			b, _ := io.ReadAll(r.Body)
@@ -314,7 +767,9 @@ func main() {
 		status, data, err := func() (int, []byte, error) {
 			req, _ := http.NewRequest(r.Method, target, body)
 			req.Header.Set("Content-Type", "application/json")
-			resp, err := http.DefaultClient.Do(req)
+			resp, err := callWithBreaker("user-service", func() (*http.Response, error) {
+				return upstreamHTTPClient.Do(req)
+			})
 			if err != nil {
 				return 0, nil, err
 			}
@@ -323,7 +778,7 @@ func main() {
 			return resp.StatusCode, d, nil
 		}()
 		if err != nil {
-			writeJSON(w, 502, map[string]string{"error": "user-service down"})
+			writeUpstreamError(w, "user-service", err)
 			return
 		}
 
@@ -340,7 +795,7 @@ func main() {
 
 	// Library template endpoints
 	mux.HandleFunc("/api/albums", func(w http.ResponseWriter, r *http.Request) {
-		target := strings.TrimRight(cfg.LibraryURL, "/") + "/albums"
+		target := cfg.libraryBase() + "/albums"
 		if r.URL.RawQuery != "" {
 			target += "?" + r.URL.RawQuery
 		}
@@ -349,12 +804,12 @@ func main() {
 			b, _ := io.ReadAll(r.Body)
 			body = bytes.NewReader(b)
 		}
-		proxyTo(w, r, target, body, true)
+		proxyTo(w, r, "library-service", target, body, true)
 	})
 
 	mux.HandleFunc("/api/albums/", func(w http.ResponseWriter, r *http.Request) {
 		path := strings.TrimPrefix(r.URL.Path, "/api")
-		target := strings.TrimRight(cfg.LibraryURL, "/") + path
+		target := cfg.libraryBase() + path
 		if r.URL.RawQuery != "" {
 			target += "?" + r.URL.RawQuery
 		}
@@ -363,12 +818,36 @@ func main() {
 			b, _ := io.ReadAll(r.Body)
 			body = bytes.NewReader(b)
 		}
-		proxyTo(w, r, target, body, true)
+		proxyTo(w, r, "library-service", target, body, true)
 	})
 
 	mux.HandleFunc("/api/my-albums", func(w http.ResponseWriter, r *http.Request) {
-		target := strings.TrimRight(cfg.LibraryURL, "/") + "/my-albums"
-		proxyTo(w, r, target, nil, true)
+		target := cfg.libraryBase() + "/my-albums"
+		proxyTo(w, r, "library-service", target, nil, true)
+	})
+
+	mux.HandleFunc("/api/playlists", func(w http.ResponseWriter, r *http.Request) {
+		target := cfg.libraryBase() + "/playlists"
+		var body io.Reader
+		if r.Body != nil && (r.Method == http.MethodPost || r.Method == http.MethodPut || r.Method == http.MethodPatch) {
+			b, _ := io.ReadAll(r.Body)
+			body = bytes.NewReader(b)
+		}
+		proxyTo(w, r, "library-service", target, body, true)
+	})
+
+	mux.HandleFunc("/api/playlists/", func(w http.ResponseWriter, r *http.Request) {
+		path := strings.TrimPrefix(r.URL.Path, "/api")
+		target := cfg.libraryBase() + path
+		if r.URL.RawQuery != "" {
+			target += "?" + r.URL.RawQuery
+		}
+		var body io.Reader
+		if r.Body != nil && (r.Method == http.MethodPost || r.Method == http.MethodPut || r.Method == http.MethodPatch) {
+			b, _ := io.ReadAll(r.Body)
+			body = bytes.NewReader(b)
+		}
+		proxyTo(w, r, "library-service", target, body, true)
 	})
 
 	// POST /api/register -> user-service /register
@@ -382,9 +861,9 @@ func main() {
 			writeJSON(w, 400, map[string]string{"error": "invalid json"})
 			return
 		}
-		status, data, err := callJSON("POST", cfg.UserURL+"/register", req)
+		status, data, err := callJSON("user-service", "POST", cfg.userBase()+"/register", req)
 		if err != nil {
-			writeJSON(w, 502, map[string]string{"error": "user-service down"})
+			writeUpstreamError(w, "user-service", err)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -403,9 +882,9 @@ func main() {
 			writeJSON(w, 400, map[string]string{"error": "invalid json"})
 			return
 		}
-		status, data, err := callJSON("POST", cfg.UserURL+"/login", req)
+		status, data, err := callJSON("user-service", "POST", cfg.userBase()+"/login", req)
 		if err != nil {
-			writeJSON(w, 502, map[string]string{"error": "user-service down"})
+			writeUpstreamError(w, "user-service", err)
 			return
 		}
 		if status != 200 {
@@ -456,9 +935,9 @@ func main() {
 		}
 
 		payload := map[string]any{"user_id": u.ID, "filename": req.Filename}
-		status, data, err := callJSON("POST", cfg.FileURL+"/files", payload)
+		status, data, err := callJSON("file-service", "POST", cfg.fileBase()+"/files", payload)
 		if err != nil {
-			writeJSON(w, 502, map[string]string{"error": "file-service down"})
+			writeUpstreamError(w, "file-service", err)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -487,11 +966,13 @@ func main() {
 			if limit := strings.TrimSpace(r.URL.Query().Get("limit")); limit != "" {
 				q.Set("limit", limit)
 			}
-			target := cfg.ProcessingURL + "/jobs?" + q.Encode()
+			target := cfg.processingBase() + "/jobs?" + q.Encode()
 			req, _ := http.NewRequest(http.MethodGet, target, nil)
-			resp, err := http.DefaultClient.Do(req)
+			resp, err := callWithBreaker("processing-service", func() (*http.Response, error) {
+				return upstreamHTTPClient.Do(req)
+			})
 			if err != nil {
-				writeJSON(w, 502, map[string]string{"error": "processing-service down"})
+				writeUpstreamError(w, "processing-service", err)
 				return
 			}
 			defer resp.Body.Close()
@@ -517,9 +998,9 @@ func main() {
 		}
 
 		payload := map[string]any{"user_id": u.ID, "file_id": req.FileID, "model": req.Model}
-		status, data, err := callJSON("POST", cfg.ProcessingURL+"/jobs", payload)
+		status, data, err := callJSON("processing-service", "POST", cfg.processingBase()+"/jobs", payload)
 		if err != nil {
-			writeJSON(w, 502, map[string]string{"error": "processing-service down"})
+			writeUpstreamError(w, "processing-service", err)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -554,9 +1035,9 @@ func main() {
 			"filename": req.Filename,
 			"user_id":  u.ID,
 		}
-		status, data, err := callJSON("POST", cfg.ProcessingURL+"/ytmp3", payload)
+		status, data, err := callJSON("processing-service", "POST", cfg.processingBase()+"/ytmp3", payload)
 		if err != nil {
-			writeJSON(w, 502, map[string]string{"error": "processing-service down"})
+			writeUpstreamError(w, "processing-service", err)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -576,8 +1057,8 @@ func main() {
 			return
 		}
 		body, _ := io.ReadAll(r.Body)
-		target := strings.TrimRight(cfg.ProcessingURL, "/") + "/input/upload"
-		proxyTo(w, r, target, bytes.NewReader(body), false)
+		target := cfg.processingBase() + "/input/upload"
+		proxyTo(w, r, "processing-service", target, bytes.NewReader(body), false)
 	})
 
 	// GET /api/jobs/{id}/download?stem=...
@@ -613,7 +1094,7 @@ func main() {
 			return
 		}
 
-		upstream := cfg.ProcessingURL + "/jobs/" + parts[0]
+		upstream := cfg.processingBase() + "/jobs/" + parts[0]
 		if len(parts) == 2 && parts[1] == "download" {
 			stem := r.URL.Query().Get("stem")
 			upstream = upstream + "/download?stem=" + url.QueryEscape(stem)
@@ -626,9 +1107,11 @@ func main() {
 		}
 
 		req, _ := http.NewRequest(http.MethodGet, upstream, nil)
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := callWithBreaker("processing-service", func() (*http.Response, error) {
+			return upstreamHTTPClient.Do(req)
+		})
 		if err != nil {
-			writeJSON(w, 502, map[string]string{"error": "processing-service down"})
+			writeUpstreamError(w, "processing-service", err)
 			return
 		}
 		defer resp.Body.Close()
@@ -644,5 +1127,6 @@ func main() {
 	})
 
 	log.Println("gateway on :8080")
-	log.Fatal(http.ListenAndServe(":8080", withCORS(mux)))
+	root := withRESTLogging(serviceName, rmqCh, withCORS(mux))
+	log.Fatal(http.ListenAndServe(":8080", otelhttp.NewHandler(root, "gateway-http")))
 }
