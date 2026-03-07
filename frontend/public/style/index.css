@@ -1,66 +1,87 @@
-/* index.css */
+:root {
+  --bg: #0a0a0f;
+  --surface: #13131a;
+  --surface2: #1c1c28;
+  --border: #2a2a3a;
+  --accent: #6c63ff;
+  --accent2: #ff6b9d;
+  --green: #1db954;
+  --text: #e8e8f0;
+  --muted: #8b8ba4;
+}
+
 body {
-  font-family: 'Inter', sans-serif;
-  background: linear-gradient(135deg, #4a148c, #880e4f);
-  color: #fff;
-  margin: 0;
-  padding: 0;
+  font-family: "DM Sans", sans-serif;
+  background:
+    radial-gradient(1200px 600px at 15% -10%, #2a2d4a 0%, transparent 65%),
+    radial-gradient(1100px 700px at 100% 110%, #2a1b34 0%, transparent 65%),
+    var(--bg);
+  color: var(--text);
 }
 
-.navbar-lofi {
-  background-color: rgba(0, 0, 0, 0.3);
-  backdrop-filter: blur(8px);
-  border-bottom: 1px solid rgba(255, 255, 255, 0.2);
+.navbar-home {
+  background: rgba(19, 19, 26, 0.9);
+  border-bottom: 1px solid var(--border);
+  backdrop-filter: blur(10px);
 }
 
-.display-4 {
-  color: #fff;
-  text-shadow: 2px 2px 6px rgba(0, 0, 0, 0.4);
+.brand-home {
+  color: var(--text);
+  font-family: "Syne", sans-serif;
+  letter-spacing: 0.2px;
 }
 
-.lead.muted {
-  color: rgba(255, 255, 255, 0.8);
+.home-title {
+  font-family: "Syne", sans-serif;
+  color: var(--text);
 }
 
-.cta-btn {
-  background: #ff4081;
-  border: none;
-  transition: all 0.3s ease;
+.home-subtitle {
+  color: var(--muted);
 }
 
-.cta-btn:hover {
-  background: #f50057;
-  transform: translateY(-2px);
+.muted {
+  color: var(--muted);
 }
 
-footer {
-  background: rgba(0, 0, 0, 0.2);
-  color: rgba(255, 255, 255, 0.7);
+.footer-home {
+  border-top: 1px solid var(--border);
+  background: rgba(19, 19, 26, 0.75);
 }
+
 .btn-space {
-  display: flex;
-  justify-content: center;
-  align-items: center;
+  all: unset;
+  display: flex !important;
+  justify-content: center !important;
+  align-items: center !important;
   width: 13rem;
-  overflow: hidden;
-  height: 3rem;
-  background-size: 300% 300%;
-  cursor: pointer;
-  backdrop-filter: blur(1rem);
-  border-radius: 5rem;
-  transition: 0.5s;
-  animation: gradient_301 5s ease infinite;
-  border: double 4px transparent;
-  background-image: linear-gradient(#212121, #212121),
-    linear-gradient(
-      137.48deg,
-      #ffdb3b 10%,
-      #fe53bb 45%,
-      #8f51ea 67%,
-      #0044ff 87%
-    );
-  background-origin: border-box;
-  background-clip: content-box, border-box;
+  overflow: hidden !important;
+  height: 3rem !important;
+  background-size: 300% 300% !important;
+  cursor: pointer !important;
+  backdrop-filter: blur(1rem) !important;
+  border-radius: 5rem !important;
+  transition: 0.5s !important;
+  animation: gradient_301 5s ease infinite !important;
+  border: double 4px transparent !important;
+  background-image:
+    linear-gradient(#212121, #212121),
+    linear-gradient(137.48deg, #ffdb3b 10%, #fe53bb 45%, #8f51ea 67%, #0044ff 87%) !important;
+  background-origin: border-box !important;
+  background-clip: content-box, border-box !important;
+  position: relative;
+}
+
+.btn-space:hover {
+  transform: scale(1.1);
+}
+
+.btn-space strong {
+  z-index: 2;
+  font-size: 12px;
+  letter-spacing: 2px;
+  color: #ffffff;
+  text-shadow: 0 0 4px white;
 }
 
 #container-stars {
@@ -72,15 +93,6 @@ footer {
   transition: 0.5s;
   backdrop-filter: blur(1rem);
   border-radius: 5rem;
-}
-
-strong {
-  z-index: 2;
-  font-family: "Avalors Personal Use";
-  font-size: 12px;
-  letter-spacing: 5px;
-  color: #ffffff;
-  text-shadow: 0 0 4px white;
 }
 
 #glow {
@@ -110,10 +122,6 @@ strong {
   background-color: #212121;
 }
 
-.btn-space:hover {
-  transform: scale(1.1);
-}
-
 .btn-space:active {
   border: double 4px #fe53bb;
   background-origin: border-box;
@@ -140,9 +148,6 @@ strong {
   width: 100%;
   height: 100%;
   animation: animStarRotate 90s linear infinite;
-}
-
-#stars::after {
   background-image: radial-gradient(#ffffff 1px, transparent 1%);
   background-size: 50px 50px;
 }
@@ -155,46 +160,25 @@ strong {
   width: 170%;
   height: 500%;
   animation: animStar 60s linear infinite;
-}
-
-#stars::before {
   background-image: radial-gradient(#ffffff 1px, transparent 1%);
   background-size: 50px 50px;
   opacity: 0.5;
 }
 
 @keyframes animStar {
-  from {
-    transform: translateY(0);
-  }
-
-  to {
-    transform: translateY(-135rem);
-  }
+  from { transform: translateY(0); }
+  to { transform: translateY(-135rem); }
 }
 
 @keyframes animStarRotate {
-  from {
-    transform: rotate(360deg);
-  }
-
-  to {
-    transform: rotate(0);
-  }
+  from { transform: rotate(360deg); }
+  to { transform: rotate(0); }
 }
 
 @keyframes gradient_301 {
-  0% {
-    background-position: 0% 50%;
-  }
-
-  50% {
-    background-position: 100% 50%;
-  }
-
-  100% {
-    background-position: 0% 50%;
-  }
+  0% { background-position: 0% 50%; }
+  50% { background-position: 100% 50%; }
+  100% { background-position: 0% 50%; }
 }
 
 @keyframes pulse_3011 {
@@ -202,21 +186,110 @@ strong {
     transform: scale(0.75);
     box-shadow: 0 0 0 0 rgba(0, 0, 0, 0.7);
   }
-
   70% {
     transform: scale(1);
     box-shadow: 0 0 0 10px rgba(0, 0, 0, 0);
   }
-
   100% {
     transform: scale(0.75);
     box-shadow: 0 0 0 0 rgba(0, 0, 0, 0);
   }
 }
-.no-bootstrap {
-  all: unset;
-  display: inline-flex;   /* inline-flex จะทำงานเหมือนปุ่ม */
-  justify-content: center;
-  align-items: center;
-  cursor: pointer;
+
+.auth-modal-shell {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  color: var(--text);
+}
+
+/* Fallback for templates that use plain Bootstrap modal classes (e.g. Django render). */
+.modal-content,
+.modal-content.bg-dark {
+  background: var(--surface) !important;
+  border: 1px solid var(--border) !important;
+  color: var(--text) !important;
+}
+
+.modal-content label,
+.modal-content .form-label {
+  color: var(--muted) !important;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-bottom: 6px;
+}
+
+.auth-label {
+  display: block !important;
+  color: var(--text) !important;
+  opacity: 1 !important;
+  visibility: visible !important;
+  font-weight: 600;
+}
+
+.modal-content input,
+.modal-content select,
+.modal-content textarea,
+.modal-content .form-control {
+  background: var(--surface2) !important;
+  border: 1px solid var(--border) !important;
+  color: var(--text) !important;
+}
+
+.modal-content input:focus,
+.modal-content select:focus,
+.modal-content textarea:focus,
+.modal-content .form-control:focus {
+  border-color: var(--accent) !important;
+  box-shadow: none !important;
+}
+
+.modal-content .text-danger {
+  color: #ff8a8a !important;
+}
+
+.nav-tabs {
+  border-bottom: 1px solid var(--border);
+}
+
+.nav-tabs .nav-link {
+  color: var(--muted);
+  border: none;
+}
+
+.nav-tabs .nav-link.active {
+  color: var(--text);
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-bottom-color: transparent;
+}
+
+.form-label {
+  color: var(--muted);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.form-control {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  color: var(--text);
+}
+
+.form-control:focus {
+  background: var(--surface2);
+  color: var(--text);
+  border-color: var(--accent);
+  box-shadow: none;
+}
+
+.btn-primary {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.btn-success {
+  background: var(--green);
+  border-color: var(--green);
 }

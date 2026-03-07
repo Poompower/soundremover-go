@@ -15,11 +15,21 @@ const state = {
   separateJobID: null,
   separatePollTimer: null,
   separateInitDone: false,
+  libraryItems: [],
+  currentLibraryItem: null,
+  syncMixer: null,
 };
+
+function getAuthToken() {
+  const token = state.token || localStorage.getItem(TOKEN_KEY) || localStorage.getItem("sv_token") || "";
+  if (token && !state.token) state.token = token;
+  return token;
+}
 
 async function api(method, path, body) {
   const opts = { method, headers: { "Content-Type": "application/json" } };
-  if (state.token) opts.headers["Authorization"] = "Bearer " + state.token;
+  const token = getAuthToken();
+  if (token) opts.headers["Authorization"] = "Bearer " + token;
   if (body) opts.body = JSON.stringify(body);
   const res = await fetch(API + path, opts);
   const data = await res.json().catch(() => ({}));
@@ -107,6 +117,9 @@ function updateSidebar() {
 }
 
 function showPage(page) {
+  if (state.currentPage === "library-track" && page !== "library-track") {
+    cleanupSyncMixer();
+  }
   state.prevPage = state.currentPage;
   state.currentPage = page;
   document.querySelectorAll(".page").forEach((p) => p.classList.remove("active"));
@@ -120,7 +133,10 @@ function showPage(page) {
 }
 
 function goBack() {
-  showPage(state.prevPage === "album" ? "discover" : state.prevPage);
+  if (state.currentPage === "library-track") {
+    cleanupSyncMixer();
+  }
+  showPage(state.prevPage === "album" || state.prevPage === "library-track" ? "discover" : state.prevPage);
 }
 
 async function loadDiscover() {
@@ -138,11 +154,40 @@ async function loadLibrary() {
   const el = document.getElementById("library-content");
   el.innerHTML = '<div class="loading"><div class="spinner"></div>Loading...</div>';
   try {
-    const albums = await api("GET", "/my-albums");
-    renderAlbumGrid(el, albums || []);
+    const data = await api("GET", "/jobs?status=SUCCEEDED&limit=60");
+    state.libraryItems = (data && data.jobs) || [];
+    renderLibraryCards(el, state.libraryItems);
   } catch (e) {
-    el.innerHTML = '<div class="empty-state"><div class="empty-state-icon">📁</div><h3>No albums yet</h3></div>';
+    el.innerHTML = `<div class="empty-state"><div class="empty-state-icon">📁</div><h3>${esc(e.message || "No songs yet")}</h3></div>`;
   }
+}
+
+function renderLibraryCards(container, items) {
+  if (!items.length) {
+    container.innerHTML = '<div class="empty-state"><div class="empty-state-icon">🎼</div><h3>No separated songs yet</h3></div>';
+    return;
+  }
+  container.innerHTML = `<div class="track-cards-grid">${items
+    .map((item) => {
+      const sourceName = item.source_filename || `job_${item.id}`;
+      const displayName = cleanSongTitle(sourceName);
+      const stems = (item.stems || []).slice(0, 4);
+      return `
+        <div class="song-card" onclick="openLibraryTrack(${item.id})">
+          <div class="song-card-title">${esc(displayName)}</div>
+          <div class="song-card-meta">Job #${item.id} • ${esc(item.model || "2stems")}</div>
+          <div class="song-card-badges">
+            ${stems.map((s) => `<span class="stem-badge">${esc(s)}</span>`).join("")}
+          </div>
+        </div>
+      `;
+    })
+    .join("")}</div>`;
+}
+
+function cleanSongTitle(filename) {
+  const base = (filename || "").split(/[\\/]/).pop() || "";
+  return base.replace(/\.[^.]+$/, "") || "Untitled";
 }
 
 function renderAlbumGrid(container, albums) {
@@ -533,7 +578,8 @@ if (state.token) {
   if (state.user) localStorage.setItem(USER_KEY, JSON.stringify(state.user));
   initApp();
 } else {
-  switchTab("login");
+  const next = encodeURIComponent("/dashboard.html");
+  window.location.href = `/?next=${next}`;
 }
 
 function initSeparatePage() {
@@ -619,12 +665,265 @@ async function handleYTMP3Submit(e) {
   }
 }
 
+function buildStemURL(jobID, stem) {
+  const q = new URLSearchParams();
+  q.set("stem", stem);
+  const token = getAuthToken();
+  if (token) q.set("token", token);
+  return `${API}/jobs/${jobID}/stream?${q.toString()}`;
+}
+
+async function openLibraryTrack(jobID) {
+  const item = (state.libraryItems || []).find((x) => x.id === jobID);
+  if (!item) {
+    showToast("Song not found", "error");
+    return;
+  }
+  cleanupSyncMixer();
+  state.prevPage = state.currentPage;
+  showPage("library-track");
+  const el = document.getElementById("library-track-detail-content");
+  const sourceName = item.source_filename || `job_${item.id}`;
+  const displayName = cleanSongTitle(sourceName);
+  const tracks = [{ key: "original", label: "Original File", audio: new Audio(buildStemURL(item.id, "original")) }];
+  (item.stems || []).forEach((stem) => {
+    tracks.push({
+      key: stem,
+      label: stem,
+      audio: new Audio(buildStemURL(item.id, stem)),
+    });
+  });
+  tracks.forEach((t) => {
+    t.audio.preload = "metadata";
+    t.enabled = true;
+    t.volume = 1;
+    t.audio.volume = 1;
+  });
+
+  state.currentLibraryItem = item;
+  state.syncMixer = {
+    jobID: item.id,
+    tracks,
+    isPlaying: false,
+    syncTimer: null,
+    isSeeking: false,
+  };
+
+  el.innerHTML = `
+    <div class="sync-panel">
+      <div class="sync-header">
+        <div class="sync-title">${esc(displayName)}</div>
+        <span class="badge badge-public">JOB #${item.id}</span>
+      </div>
+      <div class="sync-subtitle">${esc(sourceName)}</div>
+      <div class="sync-main-controls">
+        <button class="sync-btn" id="sync-play-btn" onclick="toggleSyncPlay()">Play</button>
+        <button class="sync-btn" onclick="stopSyncPlayback()">Stop</button>
+      </div>
+      <div class="mix-progress">
+        <span class="time-label" id="sync-current-time">0:00</span>
+        <div class="progress-bar" onclick="seekSyncTracks(event)">
+          <div class="progress-fill" id="sync-progress-fill" style="width:0%"></div>
+        </div>
+        <span class="time-label" id="sync-total-time">0:00</span>
+      </div>
+      <div class="mix-track-list">
+        ${tracks
+          .map(
+            (track, idx) => `
+          <div class="mix-track-row">
+            <div class="mix-track-label">${esc(track.label)}</div>
+            <input class="mix-track-volume" type="range" min="0" max="100" value="100" oninput="setSyncTrackVolume(${idx}, this.value)">
+            <button class="mix-track-toggle active" id="sync-toggle-${idx}" onclick="toggleSyncTrack(${idx})">ON</button>
+          </div>
+        `
+          )
+          .join("")}
+      </div>
+    </div>
+  `;
+
+  const ref = getSyncReferenceTrack();
+  if (ref) {
+    ref.audio.addEventListener("loadedmetadata", syncDurationLabel, { once: true });
+    ref.audio.addEventListener("timeupdate", updateSyncProgressFromReference);
+  }
+}
+
+function getSyncReferenceTrack() {
+  const mixer = state.syncMixer;
+  if (!mixer || !mixer.tracks || !mixer.tracks.length) return null;
+  return mixer.tracks.find((t) => t.key === "original") || mixer.tracks[0];
+}
+
+function syncDurationLabel() {
+  const ref = getSyncReferenceTrack();
+  if (!ref || !isFinite(ref.audio.duration)) return;
+  const total = document.getElementById("sync-total-time");
+  if (total) total.textContent = fmtTime(Math.floor(ref.audio.duration));
+}
+
+function updateSyncProgressFromReference() {
+  const mixer = state.syncMixer;
+  const ref = getSyncReferenceTrack();
+  if (!mixer || !ref || mixer.isSeeking) return;
+  if (!isFinite(ref.audio.duration) || ref.audio.duration <= 0) return;
+  const pct = (ref.audio.currentTime / ref.audio.duration) * 100;
+  const fill = document.getElementById("sync-progress-fill");
+  const current = document.getElementById("sync-current-time");
+  if (fill) fill.style.width = `${pct}%`;
+  if (current) current.textContent = fmtTime(Math.floor(ref.audio.currentTime));
+}
+
+function applySyncAlign() {
+  const mixer = state.syncMixer;
+  const ref = getSyncReferenceTrack();
+  if (!mixer || !ref) return;
+  const baseTime = ref.audio.currentTime || 0;
+  mixer.tracks.forEach((track) => {
+    if (!track.enabled || track === ref) return;
+    const drift = Math.abs((track.audio.currentTime || 0) - baseTime);
+    if (drift > 0.08) {
+      track.audio.currentTime = baseTime;
+    }
+  });
+}
+
+function toggleSyncPlay() {
+  const mixer = state.syncMixer;
+  if (!mixer) return;
+  if (mixer.isPlaying) {
+    mixer.isPlaying = false;
+    mixer.tracks.forEach((t) => t.audio.pause());
+    if (mixer.syncTimer) {
+      clearInterval(mixer.syncTimer);
+      mixer.syncTimer = null;
+    }
+    const btn = document.getElementById("sync-play-btn");
+    if (btn) btn.textContent = "Play";
+    return;
+  }
+
+  const ref = getSyncReferenceTrack();
+  if (!ref) return;
+  const baseTime = ref.audio.currentTime || 0;
+  mixer.tracks.forEach((track) => {
+    if (!track.enabled) {
+      track.audio.pause();
+      return;
+    }
+    track.audio.currentTime = baseTime;
+  });
+  const playPromises = mixer.tracks
+    .filter((track) => track.enabled)
+    .map((track) =>
+      track.audio
+        .play()
+        .then(() => true)
+        .catch(() => false)
+    );
+
+  Promise.all(playPromises).then((results) => {
+    const hasPlayingTrack = results.some(Boolean);
+    const btn = document.getElementById("sync-play-btn");
+    if (!hasPlayingTrack) {
+      mixer.isPlaying = false;
+      if (btn) btn.textContent = "Play";
+      showToast("Cannot play track (check auth/stream URL)", "error");
+      return;
+    }
+    mixer.isPlaying = true;
+    if (btn) btn.textContent = "Pause";
+    if (mixer.syncTimer) clearInterval(mixer.syncTimer);
+    mixer.syncTimer = setInterval(applySyncAlign, 300);
+  });
+}
+
+function stopSyncPlayback() {
+  const mixer = state.syncMixer;
+  if (!mixer) return;
+  mixer.isPlaying = false;
+  mixer.tracks.forEach((track) => {
+    track.audio.pause();
+    track.audio.currentTime = 0;
+  });
+  if (mixer.syncTimer) {
+    clearInterval(mixer.syncTimer);
+    mixer.syncTimer = null;
+  }
+  const btn = document.getElementById("sync-play-btn");
+  if (btn) btn.textContent = "Play";
+  const fill = document.getElementById("sync-progress-fill");
+  const current = document.getElementById("sync-current-time");
+  if (fill) fill.style.width = "0%";
+  if (current) current.textContent = "0:00";
+}
+
+function seekSyncTracks(e) {
+  const mixer = state.syncMixer;
+  const ref = getSyncReferenceTrack();
+  if (!mixer || !ref || !isFinite(ref.audio.duration) || ref.audio.duration <= 0) return;
+  const rect = e.currentTarget.getBoundingClientRect();
+  const pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+  const nextTime = pct * ref.audio.duration;
+  mixer.isSeeking = true;
+  mixer.tracks.forEach((track) => {
+    track.audio.currentTime = nextTime;
+  });
+  mixer.isSeeking = false;
+  updateSyncProgressFromReference();
+}
+
+function setSyncTrackVolume(index, value) {
+  const mixer = state.syncMixer;
+  if (!mixer || !mixer.tracks[index]) return;
+  const vol = Math.max(0, Math.min(1, Number(value) / 100));
+  mixer.tracks[index].volume = vol;
+  mixer.tracks[index].audio.volume = vol;
+}
+
+function toggleSyncTrack(index) {
+  const mixer = state.syncMixer;
+  if (!mixer || !mixer.tracks[index]) return;
+  const track = mixer.tracks[index];
+  track.enabled = !track.enabled;
+  const btn = document.getElementById(`sync-toggle-${index}`);
+  if (btn) {
+    btn.classList.toggle("active", track.enabled);
+    btn.textContent = track.enabled ? "ON" : "OFF";
+  }
+  if (!track.enabled) {
+    track.audio.pause();
+  } else if (mixer.isPlaying) {
+    const ref = getSyncReferenceTrack();
+    const targetTime = ref ? ref.audio.currentTime : 0;
+    track.audio.currentTime = targetTime;
+    track.audio.play().catch(() => {});
+  }
+}
+
+function cleanupSyncMixer() {
+  const mixer = state.syncMixer;
+  if (!mixer) return;
+  if (mixer.syncTimer) {
+    clearInterval(mixer.syncTimer);
+  }
+  mixer.tracks.forEach((track) => {
+    track.audio.pause();
+    track.audio.src = "";
+  });
+  state.syncMixer = null;
+  state.currentLibraryItem = null;
+}
+
 async function handleSeparateSubmit(e) {
   e.preventDefault();
-  const filename = (document.getElementById("separate-filename").value || "").trim();
+  const localFileEl = document.getElementById("separate-local-file");
+  let filename = (document.getElementById("separate-filename").value || "").trim();
   const model = document.getElementById("separate-model").value || "2stems";
 
-  if (!filename) {
+  const localFile = localFileEl && localFileEl.files && localFileEl.files[0] ? localFileEl.files[0] : null;
+  if (!filename && !localFile) {
     setSeparateResult("Please enter filename in audio_data/input");
     return;
   }
@@ -634,9 +933,17 @@ async function handleSeparateSubmit(e) {
     state.separatePollTimer = null;
   }
   setDownloadButtonsVisible(false);
-  setSeparateResult("Creating file record...");
+  setSeparateResult(localFile ? "Uploading local file..." : "Creating file record...");
 
   try {
+    if (localFile) {
+      const uploaded = await uploadLocalInputFile(localFile);
+      filename = uploaded.filename || filename || localFile.name;
+      document.getElementById("separate-filename").value = filename;
+    }
+    if (!filename) throw new Error("filename is required");
+
+    setSeparateResult("Creating file record...");
     const fileRes = await api("POST", "/files", { filename });
     const fileID = fileRes && fileRes.file ? fileRes.file.id : 0;
     if (!fileID) throw new Error("Cannot create file record");
@@ -653,6 +960,21 @@ async function handleSeparateSubmit(e) {
     setSeparateResult(err.message || "Create job failed");
     showToast(err.message || "Create job failed", "error");
   }
+}
+
+async function uploadLocalInputFile(file) {
+  const fd = new FormData();
+  fd.append("file", file);
+  const res = await fetch(`${API}/input/upload`, {
+    method: "POST",
+    headers: {
+      Authorization: "Bearer " + getAuthToken(),
+    },
+    body: fd,
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || "upload failed");
+  return data;
 }
 
 function startPollingJob(jobID) {
@@ -696,9 +1018,10 @@ async function downloadJobStem(stem) {
   }
   const url = `${API}/jobs/${state.separateJobID}/download?stem=${encodeURIComponent(stem)}`;
   try {
+    const token = getAuthToken();
     const res = await fetch(url, {
       headers: {
-        Authorization: "Bearer " + state.token,
+        Authorization: "Bearer " + token,
       },
     });
     if (!res.ok) {

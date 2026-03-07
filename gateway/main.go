@@ -467,14 +467,39 @@ func main() {
 	})
 
 	// POST /api/jobs (auth) -> processing-service /jobs -> push redis
+	// GET /api/jobs (auth) -> processing-service /jobs?user_id=...
 	mux.HandleFunc("/api/jobs", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
+		if r.Method != http.MethodPost && r.Method != http.MethodGet {
 			writeJSON(w, 405, map[string]string{"error": "method not allowed"})
 			return
 		}
 		u, err := parseBearer(r, cfg.JWTSecret)
 		if err != nil {
 			writeJSON(w, 401, map[string]string{"error": "unauthorized"})
+			return
+		}
+		if r.Method == http.MethodGet {
+			q := url.Values{}
+			q.Set("user_id", strconv.FormatUint(uint64(u.ID), 10))
+			if status := strings.TrimSpace(r.URL.Query().Get("status")); status != "" {
+				q.Set("status", status)
+			}
+			if limit := strings.TrimSpace(r.URL.Query().Get("limit")); limit != "" {
+				q.Set("limit", limit)
+			}
+			target := cfg.ProcessingURL + "/jobs?" + q.Encode()
+			req, _ := http.NewRequest(http.MethodGet, target, nil)
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				writeJSON(w, 502, map[string]string{"error": "processing-service down"})
+				return
+			}
+			defer resp.Body.Close()
+			if ct := resp.Header.Get("Content-Type"); ct != "" {
+				w.Header().Set("Content-Type", ct)
+			}
+			w.WriteHeader(resp.StatusCode)
+			_, _ = io.Copy(w, resp.Body)
 			return
 		}
 
@@ -539,9 +564,9 @@ func main() {
 		_, _ = w.Write(data)
 	})
 
-	// GET /api/jobs/{id}/download?stem=vocals|accompaniment (auth)
-	mux.HandleFunc("/api/jobs/", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
+	// POST /api/input/upload (auth) -> processing-service /input/upload
+	mux.HandleFunc("/api/input/upload", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
 			writeJSON(w, 405, map[string]string{"error": "method not allowed"})
 			return
 		}
@@ -550,7 +575,18 @@ func main() {
 			writeJSON(w, 401, map[string]string{"error": "unauthorized"})
 			return
 		}
+		body, _ := io.ReadAll(r.Body)
+		target := strings.TrimRight(cfg.ProcessingURL, "/") + "/input/upload"
+		proxyTo(w, r, target, bytes.NewReader(body), false)
+	})
 
+	// GET /api/jobs/{id}/download?stem=...
+	// GET /api/jobs/{id}/stream?stem=...
+	mux.HandleFunc("/api/jobs/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeJSON(w, 405, map[string]string{"error": "method not allowed"})
+			return
+		}
 		path := strings.TrimPrefix(r.URL.Path, "/api/jobs/")
 		parts := strings.Split(strings.Trim(path, "/"), "/")
 		if parts[0] == "" {
@@ -558,10 +594,32 @@ func main() {
 			return
 		}
 
+		authorized := false
+		if _, err := parseBearer(r, cfg.JWTSecret); err == nil {
+			authorized = true
+		}
+		if !authorized {
+			if rawToken := strings.TrimSpace(r.URL.Query().Get("token")); rawToken != "" {
+				reqClone := r.Clone(r.Context())
+				reqClone.Header = r.Header.Clone()
+				reqClone.Header.Set("Authorization", "Bearer "+rawToken)
+				if _, err := parseBearer(reqClone, cfg.JWTSecret); err == nil {
+					authorized = true
+				}
+			}
+		}
+		if !authorized {
+			writeJSON(w, 401, map[string]string{"error": "unauthorized"})
+			return
+		}
+
 		upstream := cfg.ProcessingURL + "/jobs/" + parts[0]
 		if len(parts) == 2 && parts[1] == "download" {
 			stem := r.URL.Query().Get("stem")
 			upstream = upstream + "/download?stem=" + url.QueryEscape(stem)
+		} else if len(parts) == 2 && parts[1] == "stream" {
+			stem := r.URL.Query().Get("stem")
+			upstream = upstream + "/stream?stem=" + url.QueryEscape(stem)
 		} else if len(parts) != 1 {
 			writeJSON(w, 404, map[string]string{"error": "not found"})
 			return

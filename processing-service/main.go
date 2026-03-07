@@ -7,10 +7,12 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"mime/multipart"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -51,6 +53,12 @@ type File struct {
 
 type fileResp struct {
 	File File `json:"file"`
+}
+
+type JobListItem struct {
+	Job
+	SourceFilename string   `json:"source_filename"`
+	Stems          []string `json:"stems,omitempty"`
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -141,6 +149,28 @@ func downloadYTMP3(audioRoot, url, preferredName string, userID uint) (string, e
 	return filepath.Base(last), nil
 }
 
+func saveUploadedInput(audioRoot string, src multipart.File, header *multipart.FileHeader) (string, error) {
+	defer src.Close()
+	inputDir := filepath.Join(audioRoot, "input")
+	if err := os.MkdirAll(inputDir, 0o755); err != nil {
+		return "", err
+	}
+	base := sanitizeFilename(header.Filename)
+	if base == "" {
+		return "", fmt.Errorf("invalid filename")
+	}
+	dstPath := filepath.Join(inputDir, base)
+	dst, err := os.Create(dstPath)
+	if err != nil {
+		return "", err
+	}
+	defer dst.Close()
+	if _, err := io.Copy(dst, src); err != nil {
+		return "", err
+	}
+	return base, nil
+}
+
 func getFileByID(fileServiceURL string, fileID uint) (File, error) {
 	url := fmt.Sprintf("%s/files/%d", strings.TrimRight(fileServiceURL, "/"), fileID)
 	res, err := http.Get(url)
@@ -222,7 +252,7 @@ func updateJobStatus(db *gorm.DB, jobID uint, status, errMsg string) {
 
 func findStemFile(audioRoot string, jobID uint64, stem string) (string, error) {
 	stem = strings.TrimSpace(strings.ToLower(stem))
-	if stem != "vocals" && stem != "accompaniment" {
+	if stem == "" || strings.Contains(stem, "/") || strings.Contains(stem, "\\") {
 		return "", fmt.Errorf("invalid stem")
 	}
 
@@ -240,6 +270,33 @@ func findStemFile(audioRoot string, jobID uint64, stem string) (string, error) {
 	return "", fmt.Errorf("stem file not found")
 }
 
+func listStemNames(audioRoot string, jobID uint64) []string {
+	patterns := []string{
+		filepath.Join(audioRoot, fmt.Sprintf("separated_%d", jobID), "*", "*.wav"),
+		filepath.Join(audioRoot, "input", fmt.Sprintf("separated_%d", jobID), "*", "*.wav"),
+	}
+	found := map[string]struct{}{}
+	for _, pattern := range patterns {
+		matches, err := filepath.Glob(pattern)
+		if err != nil {
+			continue
+		}
+		for _, p := range matches {
+			name := strings.TrimSpace(strings.ToLower(strings.TrimSuffix(filepath.Base(p), filepath.Ext(p))))
+			if name == "" {
+				continue
+			}
+			found[name] = struct{}{}
+		}
+	}
+	stems := make([]string, 0, len(found))
+	for stem := range found {
+		stems = append(stems, stem)
+	}
+	sort.Strings(stems)
+	return stems
+}
+
 func findOriginalFile(db *gorm.DB, fileServiceURL, audioRoot string, jobID uint64) (string, error) {
 	var job Job
 	if err := db.First(&job, jobID).Error; err != nil {
@@ -254,6 +311,38 @@ func findOriginalFile(db *gorm.DB, fileServiceURL, audioRoot string, jobID uint6
 		return "", fmt.Errorf("original file not found")
 	}
 	return p, nil
+}
+
+func serveAudioFile(w http.ResponseWriter, filePath, filename, contentDisposition string) {
+	ext := strings.ToLower(filepath.Ext(filePath))
+	contentType := "application/octet-stream"
+	if ext == ".mp3" {
+		contentType = "audio/mpeg"
+	}
+	if ext == ".wav" {
+		contentType = "audio/wav"
+	}
+	if ext == ".flac" {
+		contentType = "audio/flac"
+	}
+	if ext == ".ogg" {
+		contentType = "audio/ogg"
+	}
+	if ext == ".m4a" {
+		contentType = "audio/mp4"
+	}
+
+	w.Header().Set("Content-Type", contentType)
+	if contentDisposition != "" {
+		w.Header().Set("Content-Disposition", fmt.Sprintf("%s; filename=\"%s\"", contentDisposition, filename))
+	}
+	f, err := os.Open(filePath)
+	if err != nil {
+		writeJSON(w, 500, map[string]string{"error": "cannot open file"})
+		return
+	}
+	defer f.Close()
+	_, _ = io.Copy(w, f)
 }
 
 func processJob(db *gorm.DB, fileServiceURL, audioRoot, spleeterImage string, jobID uint) {
@@ -350,57 +439,120 @@ func main() {
 		writeJSON(w, 200, map[string]any{"ok": true})
 	})
 
-	http.HandleFunc("/jobs", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			writeJSON(w, 405, map[string]string{"error": "method not allowed"})
-			return
-		}
-		var req CreateJobReq
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeJSON(w, 400, map[string]string{"error": "invalid json"})
-			return
-		}
-		if req.UserID == 0 || req.FileID == 0 {
-			writeJSON(w, 400, map[string]string{"error": "missing fields"})
-			return
-		}
-		if req.Model == "" {
-			req.Model = "2stems"
-		}
+    http.HandleFunc("/jobs", func(w http.ResponseWriter, r *http.Request) {
+        if r.Method == http.MethodPost {
+            var req CreateJobReq
+            if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+                writeJSON(w, 400, map[string]string{"error": "invalid json"})
+                return
+            }
+            if req.UserID == 0 || req.FileID == 0 {
+                writeJSON(w, 400, map[string]string{"error": "missing fields"})
+                return
+            }
+            if req.Model == "" {
+                req.Model = "2stems"
+            }
 
-		job := Job{UserID: req.UserID, FileID: req.FileID, Model: req.Model, Status: "QUEUED"}
-		if err := db.Create(&job).Error; err != nil {
-			writeJSON(w, 500, map[string]string{"error": "db error"})
-			return
-		}
+            job := Job{UserID: req.UserID, FileID: req.FileID, Model: req.Model, Status: "QUEUED"}
+            if err := db.Create(&job).Error; err != nil {
+                writeJSON(w, 500, map[string]string{"error": "db error"})
+                return
+            }
 
-		// push queue (simple): list "jobs"
-		if err := rdb.LPush(ctx, "jobs", job.ID).Err(); err != nil {
-			// ถ้า push ไม่ได้ ถือว่า fail ใน MVP นี้
-			_ = db.Model(&Job{}).Where("id=?", job.ID).Update("status", "FAILED").Error
-			writeJSON(w, 500, map[string]string{"error": "redis queue error"})
-			return
-		}
+            if err := rdb.LPush(ctx, "jobs", job.ID).Err(); err != nil {
+                _ = db.Model(&Job{}).Where("id=?", job.ID).Update("status", "FAILED").Error
+                writeJSON(w, 500, map[string]string{"error": "redis queue error"})
+                return
+            }
 
-		writeJSON(w, 201, map[string]any{"job": job, "queued": true})
-	})
+            writeJSON(w, 201, map[string]any{"job": job, "queued": true})
+            return
+        }
+
+        if r.Method != http.MethodGet {
+            writeJSON(w, 405, map[string]string{"error": "method not allowed"})
+            return
+        }
+
+        userID, err := strconv.ParseUint(strings.TrimSpace(r.URL.Query().Get("user_id")), 10, 64)
+        if err != nil || userID == 0 {
+            writeJSON(w, 400, map[string]string{"error": "invalid user_id"})
+            return
+        }
+        statusFilter := strings.TrimSpace(strings.ToUpper(r.URL.Query().Get("status")))
+        limit, _ := strconv.Atoi(strings.TrimSpace(r.URL.Query().Get("limit")))
+        if limit <= 0 || limit > 200 {
+            limit = 60
+        }
+
+        q := db.Where("user_id = ?", userID)
+        if statusFilter != "" {
+            q = q.Where("status = ?", statusFilter)
+        }
+
+        var jobs []Job
+        if err := q.Order("created_at desc").Limit(limit).Find(&jobs).Error; err != nil {
+            writeJSON(w, 500, map[string]string{"error": "db error"})
+            return
+        }
+
+        items := make([]JobListItem, 0, len(jobs))
+        for _, job := range jobs {
+            item := JobListItem{Job: job}
+            if f, ferr := getFileByID(fileServiceURL, job.FileID); ferr == nil {
+                item.SourceFilename = f.Filename
+            }
+            if strings.EqualFold(job.Status, "SUCCEEDED") {
+                item.Stems = listStemNames(audioRoot, uint64(job.ID))
+            }
+            items = append(items, item)
+        }
+        writeJSON(w, 200, map[string]any{"jobs": items})
+    })
 
 	http.HandleFunc("/ytmp3", func(w http.ResponseWriter, r *http.Request) {
+        if r.Method != http.MethodPost {
+            writeJSON(w, 405, map[string]string{"error": "method not allowed"})
+            return
+        }
+        var req YTMP3Req
+        if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+            writeJSON(w, 400, map[string]string{"error": "invalid json"})
+            return
+        }
+        if strings.TrimSpace(req.URL) == "" {
+            writeJSON(w, 400, map[string]string{"error": "missing url"})
+            return
+        }
+
+        filename, err := downloadYTMP3(audioRoot, req.URL, req.Filename, req.UserID)
+        if err != nil {
+            writeJSON(w, 500, map[string]string{"error": err.Error()})
+            return
+        }
+        writeJSON(w, 201, map[string]any{
+            "ok":       true,
+            "filename": filename,
+            "path":     filepath.Join(audioRoot, "input", filename),
+        })
+    })
+
+	http.HandleFunc("/input/upload", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			writeJSON(w, 405, map[string]string{"error": "method not allowed"})
 			return
 		}
-		var req YTMP3Req
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeJSON(w, 400, map[string]string{"error": "invalid json"})
+		if err := r.ParseMultipartForm(256 << 20); err != nil {
+			writeJSON(w, 400, map[string]string{"error": "invalid multipart payload"})
 			return
 		}
-		if strings.TrimSpace(req.URL) == "" {
-			writeJSON(w, 400, map[string]string{"error": "missing url"})
+		file, header, err := r.FormFile("file")
+		if err != nil {
+			writeJSON(w, 400, map[string]string{"error": "missing file field"})
 			return
 		}
-
-		filename, err := downloadYTMP3(audioRoot, req.URL, req.Filename, req.UserID)
+		filename, err := saveUploadedInput(audioRoot, file, header)
 		if err != nil {
 			writeJSON(w, 500, map[string]string{"error": err.Error()})
 			return
@@ -412,73 +564,59 @@ func main() {
 		})
 	})
 
-	http.HandleFunc("/jobs/", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			writeJSON(w, 405, map[string]string{"error": "method not allowed"})
-			return
-		}
-		path := strings.TrimPrefix(r.URL.Path, "/jobs/")
-		parts := strings.Split(strings.Trim(path, "/"), "/")
-		if len(parts) == 0 || parts[0] == "" {
-			writeJSON(w, 400, map[string]string{"error": "invalid job id"})
-			return
-		}
-		id, err := strconv.ParseUint(parts[0], 10, 64)
-		if err != nil || id == 0 {
-			writeJSON(w, 400, map[string]string{"error": "invalid job id"})
-			return
-		}
+    http.HandleFunc("/jobs/", func(w http.ResponseWriter, r *http.Request) {
+        if r.Method != http.MethodGet {
+            writeJSON(w, 405, map[string]string{"error": "method not allowed"})
+            return
+        }
+        path := strings.TrimPrefix(r.URL.Path, "/jobs/")
+        parts := strings.Split(strings.Trim(path, "/"), "/")
+        if len(parts) == 0 || parts[0] == "" {
+            writeJSON(w, 400, map[string]string{"error": "invalid job id"})
+            return
+        }
+        id, err := strconv.ParseUint(parts[0], 10, 64)
+        if err != nil || id == 0 {
+            writeJSON(w, 400, map[string]string{"error": "invalid job id"})
+            return
+        }
 
-		if len(parts) == 2 && parts[1] == "download" {
-			stem := r.URL.Query().Get("stem")
-			var filePath string
-			var filename string
-			var contentType string
+        if len(parts) == 2 && (parts[1] == "download" || parts[1] == "stream") {
+            stem := r.URL.Query().Get("stem")
+            var filePath string
+            var filename string
+            contentDisposition := "attachment"
+            if parts[1] == "stream" {
+                contentDisposition = "inline"
+            }
 
-			if strings.EqualFold(stem, "original") {
-				filePath, err = findOriginalFile(db, fileServiceURL, audioRoot, id)
-				if err != nil {
-					writeJSON(w, 404, map[string]string{"error": err.Error()})
-					return
-				}
-				ext := strings.ToLower(filepath.Ext(filePath))
-				if ext == ".mp3" {
-					contentType = "audio/mpeg"
-				} else if ext == ".wav" {
-					contentType = "audio/wav"
-				} else {
-					contentType = "application/octet-stream"
-				}
-				filename = fmt.Sprintf("job_%d_original%s", id, ext)
-			} else {
-				filePath, err = findStemFile(audioRoot, id, stem)
-				if err != nil {
-					writeJSON(w, 404, map[string]string{"error": err.Error()})
-					return
-				}
-				filename = fmt.Sprintf("job_%d_%s.wav", id, strings.ToLower(stem))
-				contentType = "audio/wav"
-			}
+            if strings.EqualFold(stem, "original") {
+                filePath, err = findOriginalFile(db, fileServiceURL, audioRoot, id)
+                if err != nil {
+                    writeJSON(w, 404, map[string]string{"error": err.Error()})
+                    return
+                }
+                ext := strings.ToLower(filepath.Ext(filePath))
+                filename = fmt.Sprintf("job_%d_original%s", id, ext)
+            } else {
+                filePath, err = findStemFile(audioRoot, id, stem)
+                if err != nil {
+                    writeJSON(w, 404, map[string]string{"error": err.Error()})
+                    return
+                }
+                filename = fmt.Sprintf("job_%d_%s%s", id, strings.ToLower(stem), filepath.Ext(filePath))
+            }
+            serveAudioFile(w, filePath, filename, contentDisposition)
+            return
+        }
 
-			w.Header().Set("Content-Type", contentType)
-			w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", filename))
-			f, err := os.Open(filePath)
-			if err != nil {
-				writeJSON(w, 500, map[string]string{"error": "cannot open file"})
-				return
-			}
-			defer f.Close()
-			_, _ = io.Copy(w, f)
-			return
-		}
-
-		var job Job
-		if err := db.First(&job, id).Error; err != nil {
-			writeJSON(w, 404, map[string]string{"error": "job not found"})
-			return
-		}
-		writeJSON(w, 200, map[string]any{"job": job})
-	})
+        var job Job
+        if err := db.First(&job, id).Error; err != nil {
+            writeJSON(w, 404, map[string]string{"error": "job not found"})
+            return
+        }
+        writeJSON(w, 200, map[string]any{"job": job})
+    })
 
 	log.Println("processing-service on :8083")
 	log.Fatal(http.ListenAndServe(":8083", nil))

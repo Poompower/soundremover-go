@@ -37,43 +37,38 @@ function openTab(which) {
   else loginTab?.click();
 }
 
+function showAuthModal(which = "login") {
+  openTab(which);
+  const authModalEl = document.getElementById("authModal");
+  if (!authModalEl || !window.bootstrap || !bootstrap.Modal) return;
+  const modal = bootstrap.Modal.getOrCreateInstance(authModalEl);
+  modal.show();
+}
+window.showAuthModal = showAuthModal;
+
 function updateNavbar() {
   const token = getToken();
   const user = getUser();
   const navHome = document.getElementById("navHome");
   const logoutBtn = document.getElementById("logoutBtn");
   const dashboardBtn = document.getElementById("dashboardBtn");
-  const heroActions = document.getElementById("heroActions");
 
   if (token && user) {
     // auth
     logoutBtn.classList.remove("d-none");
     dashboardBtn?.classList.remove("d-none");
     navHome.href = user.is_staff ? "/admin_dashboard" : "/dashboard.html";
-
-    heroActions.innerHTML = `
-      <a class="btn btn-primary rounded-3 px-4"
-         href="${user.is_staff ? "/admin_dashboard" : "/dashboard.html"}">
-        Go to Dashboard
-      </a>
-    `;
   } else {
     logoutBtn.classList.add("d-none");
     dashboardBtn?.classList.add("d-none");
     navHome.href = "/";
-    heroActions.innerHTML = `
-      <button type="button" class="btn-space" data-bs-toggle="modal" data-bs-target="#authModal"
-        onclick="openTab('login')" id="authBtn">
-        <strong>Sign In/Sign Up</strong>
-        <div id="container-stars"><div id="stars"></div></div>
-        <div id="glow"><div class="circle"></div><div class="circle"></div></div>
-      </button>
-    `;
   }
 }
 
 document.addEventListener("DOMContentLoaded", () => {
   updateNavbar();
+  const authBtn = document.getElementById("authBtn");
+  const authModalEl = document.getElementById("authModal");
 
   const loginForm = document.getElementById("loginForm");
   const registerForm = document.getElementById("registerForm");
@@ -81,12 +76,18 @@ document.addEventListener("DOMContentLoaded", () => {
   const registerAlert = document.getElementById("registerAlert");
   const logoutBtn = document.getElementById("logoutBtn");
 
-  logoutBtn.addEventListener("click", () => {
-    clearToken();
-    updateNavbar();
-  });
+  if (authBtn && authModalEl) {
+    authBtn.addEventListener("click", () => showAuthModal("login"));
+  }
 
-  loginForm.addEventListener("submit", async (e) => {
+  if (logoutBtn) {
+    logoutBtn.addEventListener("click", () => {
+      clearToken();
+      updateNavbar();
+    });
+  }
+
+  if (loginForm) loginForm.addEventListener("submit", async (e) => {
     e.preventDefault();
     clearAlert(loginAlert);
 
@@ -124,13 +125,13 @@ document.addEventListener("DOMContentLoaded", () => {
         window.location.href = next;
         return;
       }
-      updateNavbar();
+      window.location.href = "/dashboard.html";
     } catch (err) {
       setAlert(loginAlert, "Gateway ไม่ตอบ (เช็ค docker/port)");
     }
   });
 
-  registerForm.addEventListener("submit", async (e) => {
+  if (registerForm) registerForm.addEventListener("submit", async (e) => {
     e.preventDefault();
     clearAlert(registerAlert);
 
