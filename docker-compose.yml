@@ -78,7 +78,7 @@ services:
       - jaeger
 
   processing-service:
-    build: ./processing-service
+    build: ./processing-api
     environment:
       DB_PATH: /data/processing.db
       CONSUL_ADDR: consul:8500
@@ -94,6 +94,28 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
     ports:
       - "8083:8083"
+    depends_on:
+      - consul
+      - rabbitmq
+      - file-service
+      - jaeger
+
+  processing-worker:
+    build: ./processing-worker
+    environment:
+      DB_PATH: /data/processing.db
+      CONSUL_ADDR: consul:8500
+      SERVICE_HOST: processing-worker
+      WORKER_PORT: "8085"
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      OTEL_EXPORTER_OTLP_ENDPOINT: jaeger:4318
+      FILE_SERVICE_URL: http://file-service:8082
+      AUDIO_ROOT: /data/audio
+      SPLEETER_IMAGE: poompower/spleeter:latest
+    volumes:
+      - processing_data:/data
+      - ./audio_data:/data/audio
+      - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
       - consul
       - rabbitmq
@@ -138,6 +160,7 @@ services:
       - user-service
       - file-service
       - processing-service
+      - processing-worker
       - jaeger
 
   frontend:

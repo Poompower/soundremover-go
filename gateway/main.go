@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -477,13 +478,21 @@ func upstreamStatusFromErr(err error) int {
 	if errors.Is(err, gobreaker.ErrOpenState) || errors.Is(err, gobreaker.ErrTooManyRequests) {
 		return http.StatusServiceUnavailable
 	}
-	return http.StatusBadGateway
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return http.StatusServiceUnavailable
+	}
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return http.StatusServiceUnavailable
+	}
+	return http.StatusServiceUnavailable
 }
 
 func writeUpstreamError(w http.ResponseWriter, service string, err error) {
 	status := upstreamStatusFromErr(err)
 	msg := service + " down"
-	if status == http.StatusServiceUnavailable {
+	if errors.Is(err, gobreaker.ErrOpenState) || errors.Is(err, gobreaker.ErrTooManyRequests) {
 		msg = service + " temporarily unavailable (circuit open)"
 	}
 	writeJSON(w, status, map[string]string{"error": msg})
